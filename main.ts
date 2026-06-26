@@ -25,7 +25,7 @@ export default {
 
     // ==================== 6盘 050.003 接口配置 ====================
     // 用网页版同域接口，避免跨域/404问题（如果还404，参考下方备选地址）
-    const BASE = "https://drive.2dland.cn";
+    const BASE = "https://grpcuserapi.2dland.cn";
     const API_PATH = "/v6.services.pub.PubOfflineTask/Add"; 
     // 备选接口地址（如果上面404，依次尝试）：
     // const API_PATH = "/v6.services.pub.PubOfflineTask/Add";
