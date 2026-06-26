@@ -1,4 +1,4 @@
-// main.ts — Deno Deploy entry
+// main.ts — 适配 050.003 接口的 urls 复数要求
 export default {
   async fetch(req: Request): Promise<Response> {
     if (req.method !== "POST") {
@@ -7,23 +7,29 @@ export default {
 
     const CLIENT_ID = Deno.env.get("CLIENT_ID")!;
     const CLIENT_SECRET = Deno.env.get("CLIENT_SECRET")!;
-    // 050 基址以清真云文档为准，不确定就先用 openapi.2dland.cn 或 drive.2dland.cn，抓一下确认
+    // 050 接口基址，如果后续报错可以换成 drive.2dland.cn/api
     const BASE = "https://openapi.2dland.cn";
 
-    let body: { url?: string; save_to?: string };
+    let body: { urls?: string[]; save_to?: string };
     try {
       body = await req.json();
     } catch {
-      return new Response("bad json", { status: 400 });
+      return new Response(JSON.stringify({ error: "bad json" }), { status: 400 });
     }
-    const { url, save_to = "/" } = body;
-    if (!url) return new Response("missing url", { status: 400 });
+
+    // 【修改点1】解构用 urls（复数），对应 050.003 接口要求
+    const { urls, save_to = "/" } = body;
+    // 【修改点2】校验逻辑改成检查 urls 是数组且不为空
+    if (!urls || !Array.isArray(urls) || urls.length === 0) {
+      return new Response(JSON.stringify({ error: "missing urls" }), { status: 400 });
+    }
 
     const ts = Math.floor(Date.now() / 1000).toString();
     const nonce = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
-    const bodyStr = JSON.stringify({ url, save_to });
+    // 【修改点3】转发给 050.003 的请求体也用 urls 字段
+    const bodyStr = JSON.stringify({ urls, save_to });
 
-    // Web Crypto HMAC-SHA256
+    // Web Crypto HMAC-SHA256 签名（不用改）
     const key = await crypto.subtle.importKey(
       "raw",
       new TextEncoder().encode(CLIENT_SECRET),
@@ -40,6 +46,7 @@ export default {
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("");
 
+    // 调用 050.003 离线下载接口
     const resp = await fetch(`${BASE}/050/003`, {
       method: "POST",
       headers: {
