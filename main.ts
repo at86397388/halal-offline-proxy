@@ -1,4 +1,4 @@
-// main.ts — 基线版：能部署 + 兼容 url/urls + 调试信息走响应体
+// main.ts — 正确版：050.003 要的是 url（单数）
 export default {
   async fetch(req: Request): Promise<Response> {
     if (req.method !== "POST") {
@@ -11,7 +11,7 @@ export default {
 
     if (!CLIENT_ID || !CLIENT_SECRET) {
       return new Response(
-        JSON.stringify({ error: "env not set" }),
+        JSON.stringify({ error: "env not set: check Deno Deploy Settings" }),
         { status: 500, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -21,27 +21,20 @@ export default {
       body = await req.json();
     } catch {
       return new Response(
-        JSON.stringify({ error: "bad json" }),
+        JSON.stringify({ error: "bad json, check shortcut JSON body" }),
         { status: 400, headers: { "Content-Type": "application/json" } },
       );
     }
 
-    // 兼容 url（单数）/ urls（复数）
-    let urls: string[];
-    if (Array.isArray(body.urls)) {
-      urls = body.urls as string[];
-    } else if (typeof body.url === "string") {
-      urls = [body.url as string];
+    // 归一化：快捷指令可能传 url（字符串）或 urls（数组），统一取第一个
+    let url: string;
+    if (typeof body.url === "string") {
+      url = body.url;
+    } else if (Array.isArray(body.urls) && body.urls.length > 0) {
+      url = body.urls[0] as string;
     } else {
       return new Response(
-        JSON.stringify({ error: "missing urls" }),
-        { status: 400, headers: { "Content-Type": "application/json" } },
-      );
-    }
-
-    if (urls.length === 0) {
-      return new Response(
-        JSON.stringify({ error: "empty urls" }),
+        JSON.stringify({ error: "missing url: must provide url or urls" }),
         { status: 400, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -49,9 +42,11 @@ export default {
     const save_to = (body.save_to as string) || "/";
     const ts = Math.floor(Date.now() / 1000).toString();
     const nonce = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
-    const bodyStr = JSON.stringify({ urls, save_to });
 
-    // HMAC
+    // 050.003 要的是 { url: "...", save_to: "..." }，字段名 url 单数
+    const bodyStr = JSON.stringify({ url, save_to });
+
+    // HMAC-SHA256
     const key = await crypto.subtle.importKey(
       "raw",
       new TextEncoder().encode(CLIENT_SECRET),
@@ -68,7 +63,8 @@ export default {
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("");
 
-    // 调 050.003
+    console.log("requesting 050.003 with body:", bodyStr);
+
     const resp = await fetch(`${BASE}/050/003`, {
       method: "POST",
       headers: {
@@ -82,14 +78,15 @@ export default {
     });
 
     const text = await resp.text();
+    console.log("050.003 response:", text);
 
-    // ===== 调试开关：true 时把信息吐回快捷指令，false 时走原样 =====
+    // 调试模式：把中间过程吐回快捷指令
     const DEBUG = true;
     if (DEBUG) {
       return new Response(
         JSON.stringify({
           deno_received: body,
-          deno_urls_normalized: urls,
+          deno_forwarded: JSON.parse(bodyStr),
           upstream_status: resp.status,
           upstream_body: (() => { try { return JSON.parse(text); } catch { return text; } })(),
         }, null, 2),
