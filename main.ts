@@ -15,7 +15,7 @@ export default {
     // ==================== 1. Bearer（你从 F12 抠的那串 eyJ...）====================
     // ⚠️ 不要带 "Bearer " 前缀，代码里自己拼
     // ⚠️ 这版是硬编码测试版，通了之后建议移到 Deno 环境变量，或加 refresh 逻辑
-    const BEARER = "eyJ你从F12抠的整串粘贴这里";
+    const BEARER = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhZGRvbiI6IiIsImV4cCI6MTc4MjQ5MDY2OCwiZXhwX3RzIjoxNzgyNDkwNjY4MTk4LCJpYXQiOjE3ODI0ODM0NjgsImljb24iOiIiLCJpc3MiOiJ1c2VyLWNlbnRlcjp1c2VyLWNlbnRlci01ODlmYzhkODVkLWxiZmdmIiwianRpIjoiNjhhODBlZTEtOGY2Ni00NDNkLTkyMWUtOWM0ZWYxNzlmMTEyIiwibmFtZSI6ImF0d29ya2VtYWlsIiwibmJmIjoxNzgyNDgyODY4LCJzaWQiOiI0ZGYzZGFlOS05M2VhLTQ0NTItOTZhOC1hY2IxZDg4NDI0MDUiLCJzdWIiOiIzY2I2NDFhOGQ0OGM0OTk2YjYwMTAyODM0MWVjNGZlZSIsInRpbWVtaWxsaSI6IjE3ODI0ODM0NjgxOTgiLCJ0aW1lc3RhbXAiOiIxNzgyNDgzNDY4IiwidmVyIjoyfQ.zf1AojQr3bw3QnO0BZzGavue-vpbDLxzxPS-CpN2vko";
 
     // ==================== 2. 6盘真实离线接口（你F12抓到的）====================
     const BASE = "https://grpcuserapi.2dland.cn";
