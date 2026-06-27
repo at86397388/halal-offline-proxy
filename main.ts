@@ -1,34 +1,46 @@
-/**
- * 6盘（清真云/2dland）远程离线下载中继服务 — OpenAPI 版
- * 
- * 使用 6盘新一代 OpenAPI（HL6-HMAC-SHA256 签名认证）
- * 旧的 Cookie/密码登录已废弃，改用 Client ID + Client Secret + Refresh Token
- *
- * 部署：Deno Deploy (console.deno.com)
- * 环境变量：
- *   SIXPAN_CLIENT_ID      - 客户端 ID（从 6盘授权管理页获取）
- *   SIXPAN_CLIENT_SECRET  - 客户端密钥（从 6盘授权管理页获取）
- *   SIXPAN_REFRESH_TOKEN  - 刷新令牌（首次可留空，通过 /auth 接口获取）
- *   AUTH_TOKEN            - 快捷指令鉴权 token
- *   SIXPAN_SAVE_TO        - 默认保存路径，默认 "/"
- */
+// ── 6盘（清真云）远程离线下载中继服务 v5 ───────────────────────────────
+// 基于 halalcloud/golang-sdk-lite 逆向的 OpenAPI 完整实现
+// 认证：HL6-HMAC-SHA256 签名 + Device Code 授权 + 自动 Token 刷新
+// 协议：JSON REST（非 gRPC-Web）
+// ─────────────────────────────────────────────────────────────────────
 
-const OPENAPI_HOST = "openapi.2dland.cn";
+// ── 常量 ────────────────────────────────────────────────────────────
 const SIGN_PREFIX = "HL6";
-const SIGN_ALGO   = "HL6-HMAC-SHA256";
 const REQUEST_SUFFIX = "hl6_request";
+const SIGN_ALGORITHM = "HL6-HMAC-SHA256";
+const API_HOST = "openapi.2dland.cn";
+const API_BASE = `https://${API_HOST}`;
 
-// ── HMAC-SHA256 签名（逆向自 halalcloud/golang-sdk-lite）───────
+// ── 环境变量 ────────────────────────────────────────────────────────
+const CLIENT_ID = Deno.env.get("SIXPAN_CLIENT_ID") || "";
+const CLIENT_SECRET = Deno.env.get("SIXPAN_CLIENT_SECRET") || "";
+const AUTH_TOKEN = Deno.env.get("AUTH_TOKEN") || "";
+const SAVE_PATH = Deno.env.get("SIXPAN_SAVE_TO") || "/All/";
 
+// ── Token 存储（内存，Deno Deploy 冷启动后需要重新授权）─────────────
+let accessToken = "";
+let refreshToken = "";
+let tokenExpiresAt = 0;
+
+// ── HMAC-SHA256 工具 ────────────────────────────────────────────────
 function hmacSha256(key: Uint8Array, data: Uint8Array): Uint8Array {
+  const cryptoKey = Deno.env.get("DENO_DEPLOY") ? null : null; // placeholder
   // Deno Deploy 支持 Web Crypto API
-  // 但 HMAC 需要同步计算，这里用纯 JS 实现
-  // 其实 Deno 有 crypto.subtle，但需要 async；为简化用 Node 兼容方式
-  // Deno Deploy 支持使用 crypto.subtle
-  throw new Error("Use async hmacSha256Async instead");
+  // 但由于需要多次 HMAC 迭代，我们用纯 JS 实现
+  // 使用 SubtleCrypto 是异步的，不方便迭代，改用 Deno 的 std 库
+  // 但 Deno Deploy 不支持 import，所以手动实现 HMAC-SHA256
+
+  // 简化方案：使用 Web Crypto API（异步）
+  // 但迭代签名需要同步，所以用 Deno.crypto.subtle
+  // 实际上 Deno Deploy 支持 crypto.subtle，但它是异步的
+  // 让我重新设计：先准备所有数据，再一次性调用
+
+  // 最可靠的方案：用 Deno 的 crypto.subtle（异步）
+  return new Uint8Array(); // placeholder - 实际实现在 asyncHmacSha256 中
 }
 
-async function hmacSha256Async(key: Uint8Array, data: Uint8Array): Promise<Uint8Array> {
+// 异步 HMAC-SHA256（使用 Web Crypto API，Deno Deploy 支持）
+async function asyncHmacSha256(key: Uint8Array, data: Uint8Array): Promise<Uint8Array> {
   const cryptoKey = await crypto.subtle.importKey(
     "raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
   );
@@ -36,347 +48,299 @@ async function hmacSha256Async(key: Uint8Array, data: Uint8Array): Promise<Uint8
   return new Uint8Array(sig);
 }
 
-function sha256Hex(data: string | Uint8Array): Promise<string> {
-  const encoded = typeof data === "string" ? new TextEncoder().encode(data) : data;
-  return crypto.subtle.digest("SHA-256", encoded).then(buf => {
-    return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
-  });
+async function sha256Hex(input: string): Promise<string> {
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
+async function sha256HexBytes(input: Uint8Array): Promise<string> {
+  const hash = await crypto.subtle.digest("SHA-256", input);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function hexEncode(buf: Uint8Array): string {
+  return Array.from(buf).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ── HL6-HMAC-SHA256 签名 ───────────────────────────────────────────
 async function signRequest(
-  clientId: string, clientSecret: string, accessToken: string,
-  method: string, apiPath: string, params: Record<string, string>,
-  requestBody: string, extraHeaders: Record<string, string>,
+  method: string, apiPath: string, body: Uint8Array | null,
+  accessToken: string, clientId: string, clientSecret: string,
+  extraParams?: Record<string, string>,
 ): Promise<{ url: string; headers: Record<string, string> }> {
+
   const utcTime = new Date();
   const dateString = utcTime.toISOString().split("T")[0]; // YYYY-MM-DD
-  const rfc3339 = utcTime.toISOString();
-  const nonce = Date.now().toString(36) + Math.random().toString(36).substring(2, 8);
+  const nonce = BigInt(utcTime.getTime() * 1_000_000).toString(36); // base36 of unix micro
+  const timestamp = utcTime.toISOString(); // RFC3339
 
   // 构建 headers
   const headers: Record<string, string> = {
-    "host": OPENAPI_HOST,
+    "host": API_HOST,
     "x-hl-nonce": nonce,
-    "x-hl-timestamp": rfc3339,
+    "x-hl-timestamp": timestamp,
     "other-header": "other-value",
   };
 
-  // 合入额外 headers
-  for (const [k, v] of Object.entries(extraHeaders)) {
-    if (k.toLowerCase() !== "authorization") {
-      headers[k.toLowerCase()] = v;
-    }
+  // 确定 HeadersToSign
+  const headersToSign: string[] = ["host", "x-hl-nonce", "x-hl-timestamp", "other-header"];
+
+  // 如果有 body，添加 content-type
+  if (body) {
+    headers["content-type"] = "application/json; charset=utf-8";
+    headersToSign.push("content-type");
   }
 
-  // 确定 signedHeaders
-  const headersToSign = new Set<string>(["host", "x-hl-nonce", "x-hl-timestamp", "other-header"]);
-  for (const [k] of Object.entries(extraHeaders)) {
-    const lk = k.toLowerCase();
-    if (lk === "content-type" || lk.startsWith("x-hl-")) {
-      headersToSign.add(lk);
+  // 确保唯一
+  const uniqueHeadersToSign = [...new Set(headersToSign)].sort();
+
+  // 构建 Canonical Headers
+  const canonicalHeaders = uniqueHeadersToSign
+    .filter(h => headers[h])
+    .map(h => `${h}:${headers[h]}`)
+    .join("\n") + "\n";
+
+  const signedHeaders = uniqueHeadersToSign.join(";");
+
+  // 构建 Sorted Query String
+  let sortedQueryString = "";
+  if (extraParams && Object.keys(extraParams).length > 0) {
+    const encodedParams: Record<string, string> = {};
+    const keys: string[] = [];
+    for (const [k, v] of Object.entries(extraParams)) {
+      const ek = rfc3986Encode(k);
+      encodedParams[ek] = v ? rfc3986Encode(v) : "";
+      keys.push(ek);
     }
+    keys.sort();
+    sortedQueryString = keys.map(k => `${k}=${encodedParams[k]}`).join("&");
   }
 
-  // Canonical headers
-  const sortedHeaderNames = [...headersToSign].sort();
-  const canonicalHeaders = sortedHeaderNames
-    .filter(h => headers[h] !== undefined)
-    .map(h => `${h}:${headers[h]}\n`)
-    .join("");
-  const signedHeadersStr = sortedHeaderNames.join(";");
-
-  // Sorted query string
-  const sortedParams = Object.entries(params)
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([k, v]) => `${rfc3986Encode(k)}=${v ? rfc3986Encode(v) : ""}`)
-    .join("&");
-
-  // SHA256 of body
-  const bodyHash = await sha256Hex(requestBody);
-
-  // Canonical request
+  // 构建 Canonical Request
+  const bodyHash = body ? await sha256HexBytes(body) : await sha256Hex("");
   const canonicalRequest = [
     method,
     apiPath,
-    sortedParams,
+    sortedQueryString,
     canonicalHeaders,
-    signedHeadersStr,
+    signedHeaders,
     bodyHash,
   ].join("\n");
 
-  // Credential scope
+  // Credential Scope
   const credentialScope = `${dateString}/${accessToken}/${REQUEST_SUFFIX}`;
 
-  // String to sign
+  // String To Sign
   const hashedCanonical = await sha256Hex(canonicalRequest);
   const stringToSign = [
-    SIGN_ALGO,
-    rfc3339,
+    SIGN_ALGORITHM,
+    timestamp,
     credentialScope,
     hashedCanonical,
   ].join("\n");
 
-  // Derive signing key
+  // Derive Signing Key
   const secretKeyBytes = new TextEncoder().encode(SIGN_PREFIX + clientSecret);
-  const dateKey = await hmacSha256Async(secretKeyBytes, new TextEncoder().encode(dateString));
-  const accessTokenKey = await hmacSha256Async(dateKey, new TextEncoder().encode(accessToken));
-  const signingKey = await hmacSha256Async(accessTokenKey, new TextEncoder().encode(REQUEST_SUFFIX));
+  const dateKey = await asyncHmacSha256(secretKeyBytes, new TextEncoder().encode(dateString));
+  const accessTokenKey = await asyncHmacSha256(dateKey, new TextEncoder().encode(accessToken));
+  const signingKey = await asyncHmacSha256(accessTokenKey, new TextEncoder().encode(REQUEST_SUFFIX));
 
-  // Calculate signature
-  const signatureBytes = await hmacSha256Async(signingKey, new TextEncoder().encode(stringToSign));
-  const signature = [...signatureBytes].map(b => b.toString(16).padStart(2, "0")).join("");
+  // Calculate Signature
+  const signatureBytes = await asyncHmacSha256(signingKey, new TextEncoder().encode(stringToSign));
+  const signature = hexEncode(signatureBytes);
 
-  // Authorization header
-  const authorization = `${SIGN_ALGO} Credential=${clientId}/${credentialScope}, SignedHeaders=${signedHeadersStr}, Signature=${signature}`;
-
+  // Authorization Header
+  const authorization = `${SIGN_ALGORITHM} Credential=${clientId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
   headers["authorization"] = authorization;
 
   // Build URL
-  const url = `https://${OPENAPI_HOST}${apiPath}${sortedParams ? "?" + sortedParams : ""}`;
+  const url = `https://${API_HOST}${apiPath}${sortedQueryString ? "?" + sortedQueryString : ""}`;
 
   return { url, headers };
 }
 
 function rfc3986Encode(s: string): string {
-  return encodeURIComponent(s).replace(/\+/g, "%20");
+  return encodeURIComponent(s).replace(/%20/g, "+").replace(/!/g, "%21")
+    .replace(/'/g, "%27").replace(/\(/g, "%28").replace(/\)/g, "%29");
 }
 
-// ── Token 管理 ──────────────────────────────────────────────────
-
-interface TokenInfo {
-  accessToken: string;
-  refreshToken: string;
-  expiresAt: number; // Unix ms
-}
-
-let tokenCache: TokenInfo | null = null;
-
-async function refreshTokenFlow(
-  clientId: string, clientSecret: string, refreshToken: string,
-): Promise<TokenInfo> {
-  const body = JSON.stringify({
-    refresh_token: refreshToken,
-    grant_type: "refresh_token",
-    client_id: clientId,
-  });
+// ── API 调用 ────────────────────────────────────────────────────────
+async function apiCall<T>(
+  method: string, apiPath: string,
+  body?: Record<string, unknown>,
+  accessTokenOverride?: string,
+  params?: Record<string, string>,
+): Promise<T> {
+  const currentAccessToken = accessTokenOverride || accessToken;
+  const bodyBytes = body ? new TextEncoder().encode(JSON.stringify(body)) : null;
 
   const { url, headers } = await signRequest(
-    clientId, clientSecret, "", // accessToken 为空（刷新 token 时不需要）
-    "POST", "/v6/oauth/refresh_token", {},
-    body,
-    { "content-type": "application/json; charset=utf-8" },
+    method, apiPath, bodyBytes, currentAccessToken, CLIENT_ID, CLIENT_SECRET, params
   );
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers,
-    body,
-  });
-
-  const text = await resp.text();
-  if (!resp.ok) {
-    throw new Error(`刷新 token 失败 (HTTP ${resp.status}): ${text.substring(0, 300)}`);
-  }
-
-  let json: any;
-  try { json = JSON.parse(text); }
-  catch { throw new Error(`刷新 token 返回非 JSON: ${text.substring(0, 300)}`); }
-
-  if (!json.access_token) {
-    throw new Error(`刷新 token 返回无效: ${text.substring(0, 300)}`);
-  }
-
-  return {
-    accessToken: json.access_token,
-    refreshToken: json.refresh_token || refreshToken,
-    expiresAt: Date.now() + (json.expires_in || 3600) * 1000,
+  const fetchOptions: RequestInit = {
+    method,
+    headers: Object.entries(headers).map(([k, v]) => [k, v]),
   };
+  if (bodyBytes) {
+    fetchOptions.body = bodyBytes;
+  }
+
+  const resp = await fetch(url, fetchOptions);
+  const respText = await resp.text();
+
+  // 检查是否返回 HTML（6盘封存状态）
+  if (respText.trimStart().startsWith("<")) {
+    throw new Error(`6盘 API 返回 HTML（可能处于封存/维护状态）。HTTP ${resp.status}`);
+  }
+
+  if (resp.status === 401 && !accessTokenOverride) {
+    // Token 过期，尝试刷新
+    const refreshed = await refreshAccessToken();
+    if (refreshed) {
+      // 重试一次
+      return apiCall<T>(method, apiPath, body, accessToken, params);
+    }
+    throw new Error("Token 过期且刷新失败，请重新授权");
+  }
+
+  if (resp.status < 200 || resp.status >= 300) {
+    let errMsg = `HTTP ${resp.status}`;
+    try {
+      const errJson = JSON.parse(respText);
+      errMsg += `: ${errJson.message || errJson.error || respText.substring(0, 200)}`;
+    } catch {
+      errMsg += `: ${respText.substring(0, 200)}`;
+    }
+    throw new Error(errMsg);
+  }
+
+  return JSON.parse(respText) as T;
 }
 
-async function getAccessToken(): Promise<string> {
-  const clientId     = (Deno.env.get("SIXPAN_CLIENT_ID") || "").trim();
-  const clientSecret = (Deno.env.get("SIXPAN_CLIENT_SECRET") || "").trim();
-  const initialRT    = (Deno.env.get("SIXPAN_REFRESH_TOKEN") || "").trim();
+// ── Token 管理 ──────────────────────────────────────────────────────
 
-  if (!clientId || !clientSecret) {
-    throw new Error(
-      "请配置环境变量：\n" +
-      "  SIXPAN_CLIENT_ID — 从 6盘 授权管理页获取\n" +
-      "  SIXPAN_CLIENT_SECRET — 从 6盘 授权管理页获取\n" +
-      "  SIXPAN_REFRESH_TOKEN — 首次可留空，访问 /auth 获取\n" +
-      "\n获取步骤：\n" +
-      "  1. 登录 https://drive.2dland.cn\n" +
-      "  2. 用户中心 → 授权管理 → 新建授权\n" +
-      "  3. 记录 Client ID 和 Client Secret"
+// 刷新 Access Token
+async function refreshAccessToken(): Promise<boolean> {
+  if (!refreshToken) return false;
+  try {
+    const resp = await apiCall<{ access_token: string; refresh_token: string; expires_in: number }>(
+      "POST", "/v6/oauth/refresh_token",
+      {
+        refresh_token: refreshToken,
+        grant_type: "refresh_token",
+        client_id: CLIENT_ID,
+      },
+      accessToken, // 刷新 token 请求用当前 accessToken 签名
     );
+    accessToken = resp.access_token;
+    refreshToken = resp.refresh_token;
+    tokenExpiresAt = Date.now() + resp.expires_in * 1000;
+    console.log(`Token 刷新成功，有效期 ${resp.expires_in} 秒`);
+    return true;
+  } catch (err) {
+    console.error("Token 刷新失败:", err);
+    return false;
   }
-
-  // 检查缓存
-  if (tokenCache && tokenCache.expiresAt > Date.now()) {
-    return tokenCache.accessToken;
-  }
-
-  // 需要刷新
-  const rt = tokenCache?.refreshToken || initialRT;
-  if (!rt) {
-    throw new Error(
-      "缺少 Refresh Token，请先访问 /auth 接口获取授权\n" +
-      "或者手动在 6盘网站获取 Refresh Token 后设置环境变量 SIXPAN_REFRESH_TOKEN"
-    );
-  }
-
-  const result = await refreshTokenFlow(clientId, clientSecret, rt);
-  tokenCache = result;
-  
-  console.log(`Token 刷新成功，有效期至 ${new Date(result.expiresAt).toISOString()}`);
-  return result.accessToken;
 }
 
-// ── 6盘 OpenAPI 调用 ───────────────────────────────────────────
-
-async function callAPI(
-  method: string, apiPath: string, 
-  params: Record<string, string>, body: any,
-): Promise<any> {
-  const clientId     = (Deno.env.get("SIXPAN_CLIENT_ID") || "").trim();
-  const clientSecret = (Deno.env.get("SIXPAN_CLIENT_SECRET") || "").trim();
-  const accessToken  = await getAccessToken();
-
-  const bodyStr = body ? JSON.stringify(body) : "";
-  const extraHeaders: Record<string, string> = {};
-  if (body) {
-    extraHeaders["content-type"] = "application/json; charset=utf-8";
+// 确保 Token 有效
+async function ensureToken(): Promise<void> {
+  if (!accessToken || !refreshToken || tokenExpiresAt < Date.now()) {
+    // 尝试刷新
+    if (refreshToken) {
+      const ok = await refreshAccessToken();
+      if (ok) return;
+    }
+    throw new Error("需要重新授权。请访问 /auth 获取新的授权码");
   }
+  // Token 还有效，提前 5 分钟刷新
+  if (tokenExpiresAt - Date.now() < 5 * 60 * 1000) {
+    await refreshAccessToken();
+  }
+}
 
-  const { url, headers } = await signRequest(
-    clientId, clientSecret, accessToken,
-    method, apiPath, params, bodyStr, extraHeaders,
+// ── Device Code 授权流程 ────────────────────────────────────────────
+
+// Step 1: 申请设备授权码
+async function requestDeviceCode(): Promise<{
+  user_code: string; device_code: string; verification_uri: string;
+  expires_in: number; interval: number;
+}> {
+  return await apiCall("POST", "/v6/oauth/device_code", {
+    client_id: CLIENT_ID,
+    response_type: "device_code",
+    scope: "read write offline",
+    device: "sixpan-relay-deno",
+  }, "", // 初始授权没有 accessToken
   );
-
-  const resp = await fetch(url, { method, headers, body: bodyStr || undefined });
-  const text = await resp.text();
-
-  // 401 → 尝试刷新 token 后重试一次
-  if (resp.status === 401) {
-    tokenCache = null;
-    const accessToken2 = await getAccessToken();
-    const { url: url2, headers: headers2 } = await signRequest(
-      clientId, clientSecret, accessToken2,
-      method, apiPath, params, bodyStr, extraHeaders,
-    );
-    const resp2 = await fetch(url2, { method, headers: headers2, body: bodyStr || undefined });
-    const text2 = await resp2.text();
-    if (!resp2.ok) throw new Error(`API 调用失败 (HTTP ${resp2.status}): ${text2.substring(0, 300)}`);
-    try { return JSON.parse(text2); }
-    catch { throw new Error(`API 返回非 JSON: ${text2.substring(0, 300)}`); }
-  }
-
-  if (!resp.ok) throw new Error(`API 调用失败 (HTTP ${resp.status}): ${text.substring(0, 300)}`);
-
-  try { return JSON.parse(text); }
-  catch { throw new Error(`API 返回非 JSON: ${text.substring(0, 300)}`); }
 }
 
-// ── 离线下载 ────────────────────────────────────────────────────
-
-async function parseUrl(url: string): Promise<any> {
-  return await callAPI("POST", "/v6/user/offline/parse", {}, { url });
+// Step 2: 检查授权状态
+async function checkDeviceCodeState(deviceCode: string): Promise<{
+  login: boolean; access_token?: string; refresh_token?: string;
+  expires_in?: number; status?: string;
+}> {
+  return await apiCall("POST", "/v6/oauth/get_device_code_state", {
+    device_code: deviceCode,
+  }, accessToken || "");
 }
 
-async function addOfflineTask(
-  infoHash: string, saveTo: string, fileName: string,
-  fileCount: number, fileSize: number, fileList: string,
-): Promise<any> {
-  return await callAPI("POST", "/v6/user/offline/add", {}, {
-    info_hash: infoHash,
-    save_to: saveTo,
-    file_name: fileName,
-    file_count: fileCount,
-    file_size: fileSize,
-    file_list: fileList,
+// ── 离线下载 API ────────────────────────────────────────────────────
+
+interface ParseResult {
+  meta?: {
+    identity: string; type: number; status: number; name: string; size: number;
+    url: string; code: number; message: string;
+  };
+  task_files?: Array<{
+    identity: string; path: string; name: string; size: number;
+    status: number; directory: boolean; index: number;
+  }>;
+}
+
+interface AddResult {
+  identity: string; type: number; status: number; name: string;
+  url: string; save_path: string; code: number; message: string;
+}
+
+// 解析磁力链
+async function parseMagnet(magnetUrl: string): Promise<ParseResult> {
+  return await apiCall<ParseResult>("POST", "/v6/offline_task/parse", {
+    url: magnetUrl,
   });
 }
 
-async function listOfflineTasks(): Promise<any> {
-  return await callAPI("POST", "/v6/user/offline/list", {}, {});
-}
+// 添加离线下载任务
+async function addOfflineTask(
+  magnetUrl: string, savePath: string, parseResult?: ParseResult,
+): Promise<AddResult> {
+  const taskBody: Record<string, unknown> = {
+    url: magnetUrl,
+    save_path: savePath,
+  };
 
-// ── OAuth2 授权流程（获取初始 Refresh Token）───────────────────
-// 用户访问 /auth 页面 → 重定向到 6盘授权页 → 授权后回调 → 获取 refresh_token
-
-const OAUTH_AUTH_URL = `https://drive.2dland.cn/oauth/authorize`;
-
-async function handleAuth(request: Request): Promise<Response> {
-  const url = new URL(request.url);
-  const clientId = (Deno.env.get("SIXPAN_CLIENT_ID") || "").trim();
-  
-  if (!clientId) {
-    return new Response("请先设置环境变量 SIXPAN_CLIENT_ID", { status: 400 });
+  // 如果有解析结果，填充更多信息
+  if (parseResult?.meta) {
+    taskBody.name = parseResult.meta.name || "";
+    taskBody.size = parseResult.meta.size || 0;
+    taskBody.identity = parseResult.meta.identity || "";
+    taskBody.type = parseResult.meta.type || 0;
   }
 
-  // 如果是回调（带有 code 参数）
-  const code = url.searchParams.get("code");
-  if (code) {
-    const clientSecret = (Deno.env.get("SIXPAN_CLIENT_SECRET") || "").trim();
-    // 用 code 换取 refresh_token
-    const body = JSON.stringify({
-      grant_type: "authorization_code",
-      code: code,
-      client_id: clientId,
-      client_secret: clientSecret,
-      redirect_uri: `${url.origin}/auth`,
-    });
-
-    const { url: tokenUrl, headers: tokenHeaders } = await signRequest(
-      clientId, clientSecret, "",
-      "POST", "/v6/oauth/token", {},
-      body,
-      { "content-type": "application/json; charset=utf-8" },
-    );
-
-    const resp = await fetch(tokenUrl, { method: "POST", headers: tokenHeaders, body });
-    const text = await resp.text();
-    
-    if (!resp.ok) {
-      return jsonResponse({ success: false, error: `授权失败: ${text.substring(0, 300)}` }, 400);
-    }
-
-    let json: any;
-    try { json = JSON.parse(text); }
-    catch { return jsonResponse({ success: false, error: `授权返回非 JSON: ${text.substring(0, 200)}` }, 400); }
-
-    if (json.refresh_token) {
-      // 缓存 token
-      tokenCache = {
-        accessToken: json.access_token || "",
-        refreshToken: json.refresh_token,
-        expiresAt: Date.now() + (json.expires_in || 3600) * 1000,
-      };
-
-      return new Response(
-        `<html><body style="font-family:sans-serif;text-align:center;padding:40px">
-        <h1>✅ 授权成功！</h1>
-        <p>Refresh Token 已自动获取并缓存。</p>
-        <p>请将以下值设置为 Deno Deploy 环境变量 <b>SIXPAN_REFRESH_TOKEN</b>：</p>
-        <textarea style="width:80%;height:60px;font-size:14px">${json.refresh_token}</textarea>
-        <p style="color:#999;font-size:13px">设置后服务将自动刷新 token，无需再次授权</p>
-        </body></html>`,
-        { headers: { "Content-Type": "text/html; charset=utf-8" } }
-      );
-    }
-
-    return jsonResponse({ success: false, error: "授权响应中缺少 refresh_token", raw: text.substring(0, 300) }, 400);
-  }
-
-  // 重定向到 6盘授权页
-  const redirectUri = `${url.origin}/auth`;
-  const authUrl = `${OAUTH_AUTH_URL}?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=all`;
-  return Response.redirect(authUrl, 302);
+  return await apiCall<AddResult>("POST", "/v6/offline_task/add", taskBody);
 }
 
-// ── HTTP 处理 ──────────────────────────────────────────────────
+// 列出离线下载任务
+async function listOfflineTasks(): Promise<unknown> {
+  return await apiCall("POST", "/v6/offline_task/list", {
+    list_info: { limit: 20, version: 0 },
+  });
+}
 
-function jsonResponse(data: any, status = 200): Response {
+// ── HTTP 路由 ───────────────────────────────────────────────────────
+
+function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data, null, 2), {
     status,
     headers: { "Content-Type": "application/json; charset=utf-8" },
@@ -384,263 +348,323 @@ function jsonResponse(data: any, status = 200): Response {
 }
 
 function authCheck(request: Request): boolean {
-  const authToken = Deno.env.get("AUTH_TOKEN");
-  if (!authToken) return true;
   const url = new URL(request.url);
-  const token = url.searchParams.get("token") || request.headers.get("X-Auth-Token") || "";
-  return token === authToken;
+  const token = url.searchParams.get("token") ||
+    request.headers.get("Authorization")?.replace("Bearer ", "") || "";
+  return token === AUTH_TOKEN;
 }
 
+// ── 路由处理 ─────────────────────────────────────────────────────────
+
 async function handleAdd(request: Request): Promise<Response> {
-  if (!authCheck(request)) {
-    return jsonResponse({ success: false, error: "鉴权失败，请在 URL 中附加 ?token=xxx" }, 401);
-  }
-
-  let body: any;
-  try { body = await request.json(); }
-  catch { return jsonResponse({ success: false, error: "无效的 JSON，需要 {\"magnet\": \"...\"}" }, 400); }
-
-  const magnet = body.magnet || body.url || "";
-  if (!magnet) return jsonResponse({ success: false, error: "缺少 magnet 字段" }, 400);
-
-  const saveTo = body.saveTo || new URL(request.url).searchParams.get("saveTo") || Deno.env.get("SIXPAN_SAVE_TO") || "/";
+  if (request.method !== "POST") return jsonResponse({ error: "仅支持 POST，请用快捷指令调用" }, 405);
+  if (!authCheck(request)) return jsonResponse({ error: "鉴权失败" }, 401);
 
   try {
-    // ① 解析磁力链
-    const parseResult = await parseUrl(magnet) as any;
+    const body = await request.json() as { magnet?: string; url?: string; saveTo?: string };
+    const magnetUrl = body.magnet || body.url || "";
+    const savePath = body.saveTo || SAVE_PATH;
 
-    if (!parseResult.data && !parseResult.info_hash) {
-      return jsonResponse({
-        success: false,
-        error: parseResult.message || "解析磁力链失败",
-        raw: JSON.stringify(parseResult).substring(0, 300),
-      }, 400);
+    if (!magnetUrl) return jsonResponse({ error: "缺少 magnet/url 参数" }, 400);
+    if (!magnetUrl.startsWith("magnet:") && !magnetUrl.startsWith("http") && !magnetUrl.startsWith("ed2k")) {
+      return jsonResponse({ error: "仅支持 magnet/http/ed2k 链接" }, 400);
     }
 
-    // 适配可能的响应格式
-    const data = parseResult.data || parseResult;
-    const infoHash   = data.info_hash || data.infoHash || "";
-    const name       = data.name || data.file_name || "未知";
-    const files      = data.files || [];
-    const fileCount  = files.length || data.file_count || 1;
-    const fileSize   = files.reduce ? files.reduce((s: number, f: any) => s + (f.size || 0), 0) : (data.file_size || 0);
-    const fileList   = files.map ? files.map((f: any) => f.name || f.file_name).join(",") : (data.file_list || "");
+    await ensureToken();
 
-    if (!infoHash) {
-      return jsonResponse({ success: false, error: "解析结果缺少 infoHash", raw: JSON.stringify(parseResult).substring(0, 300) }, 400);
+    // Step 1: 解析
+    let parseResult: ParseResult | undefined;
+    try {
+      parseResult = await parseMagnet(magnetUrl);
+    } catch (err) {
+      console.log("Parse 失败（不影响 Add）:", err);
     }
 
-    // ② 提交离线任务
-    const addResult = await addOfflineTask(infoHash, saveTo, name, fileCount, fileSize, fileList) as any;
-
-    if (addResult.error || addResult.message && !addResult.task_id) {
-      return jsonResponse({
-        success: false,
-        error: addResult.message || addResult.error || "提交离线任务失败",
-        raw: JSON.stringify(addResult).substring(0, 300),
-      }, 400);
-    }
+    // Step 2: 添加任务
+    const addResult = await addOfflineTask(magnetUrl, savePath, parseResult);
 
     return jsonResponse({
       success: true,
-      taskId: addResult.task_id || addResult.taskId || addResult.data?.task_id,
-      name, infoHash, fileCount, fileSize, saveTo,
-      message: "离线下载任务已提交 ✅",
+      message: `离线任务已提交 ✅`,
+      task: addResult,
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes("401") || msg.includes("token")) tokenCache = null;
-    return jsonResponse({ success: false, error: msg }, 500);
+    return jsonResponse({
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+      hint: err instanceof Error && err.message.includes("重新授权")
+        ? "请访问 /auth 重新获取授权"
+        : undefined,
+    }, 500);
   }
+}
+
+async function handleAuth(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const action = url.searchParams.get("action");
+
+  if (action === "start") {
+    // Step 1: 申请设备授权码
+    try {
+      const deviceCodeResp = await requestDeviceCode();
+      return jsonResponse({
+        step1: "请在浏览器/手机打开以下链接，输入验证码授权",
+        verification_uri: deviceCodeResp.verification_uri,
+        user_code: deviceCodeResp.user_code,
+        device_code: deviceCodeResp.device_code,
+        expires_in: deviceCodeResp.expires_in,
+        hint: `授权后，访问 /auth?action=check&device_code=${deviceCodeResp.device_code} 检查状态`,
+      });
+    } catch (err) {
+      return jsonResponse({
+        error: "获取设备授权码失败",
+        detail: err instanceof Error ? err.message : String(err),
+        env_check: {
+          has_client_id: !!CLIENT_ID,
+          has_client_secret: !!CLIENT_SECRET,
+          client_id_prefix: CLIENT_ID ? CLIENT_ID.substring(0, 8) + "***" : "未设置",
+        },
+      }, 500);
+    }
+  }
+
+  if (action === "check") {
+    const deviceCode = url.searchParams.get("device_code") || "";
+    if (!deviceCode) return jsonResponse({ error: "缺少 device_code 参数" }, 400);
+
+    try {
+      const state = await checkDeviceCodeState(deviceCode);
+      if (state.login && state.access_token && state.refresh_token) {
+        // 授权成功！保存 token
+        accessToken = state.access_token;
+        refreshToken = state.refresh_token;
+        tokenExpiresAt = Date.now() + (state.expires_in || 3600) * 1000;
+
+        return jsonResponse({
+          success: true,
+          message: "授权成功 ✅ Token 已保存，现在可以正常使用离线下载了",
+          expires_in: state.expires_in,
+          hint: "iPhone 快捷指令调用 /add 即可",
+        });
+      }
+
+      return jsonResponse({
+        success: false,
+        status: state.status || "pending",
+        message: "尚未授权，请先在浏览器完成授权",
+        login: state.login,
+        hint: "授权后再次访问此链接检查",
+      });
+    } catch (err) {
+      return jsonResponse({
+        error: "检查授权状态失败",
+        detail: err instanceof Error ? err.message : String(err),
+      }, 500);
+    }
+  }
+
+  // 默认：显示授权指导页面
+  const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>6盘授权</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; line-height: 1.8; }
+  h1 { color: #333; } h2 { color: #555; }
+  .step { background: #f8f9fa; padding: 15px; border-radius: 8px; margin: 15px 0; }
+  .btn { display: inline-block; padding: 10px 20px; background: #007bff; color: white; border-radius: 6px;
+    text-decoration: none; margin: 10px 0; }
+  .warn { background: #fff3cd; padding: 12px; border-radius: 6px; color: #856404; }
+  code { background: #e9ecef; padding: 2px 6px; border-radius: 3px; }
+</style></head><body>
+<h1>6盘（清真云）离线下载 — 授权</h1>
+
+<div class="warn">⚠️ 6盘已于 2026-06-20 进入「封存状态」，API 可能不稳定。现有用户仍可使用。</div>
+
+<h2>步骤 1：获取设备授权码</h2>
+<div class="step">
+  点击下方按钮申请授权码（需要先设置环境变量 <code>SIXPAN_CLIENT_ID</code> 和 <code>SIXPAN_CLIENT_SECRET</code>）
+  <br><a class="btn" href="/auth?action=start">申请授权码 →</a>
+</div>
+
+<h2>步骤 2：在浏览器授权</h2>
+<div class="step">
+  Step 1 会返回一个 <code>verification_uri</code> 和 <code>user_code</code>
+  <br>在浏览器打开 verification_uri，输入 user_code 完成授权
+</div>
+
+<h2>步骤 3：检查授权状态</h2>
+<div class="step">
+  授权完成后，访问：<br>
+  <code>/auth?action=check&device_code=你的device_code</code>
+  <br>成功后 Token 自动保存，即可正常使用
+</div>
+
+<h2>如何获取 Client ID 和 Client Secret？</h2>
+<div class="step">
+  1. 登录 <a href="https://drive.2dland.cn" target="_blank">drive.2dland.cn</a>
+  <br>2. 用户中心 → 授权管理 → 输入密码验证身份
+  <br>3. 新建授权（名称随意）→ 获得 Client ID + Client Secret
+  <br>4. 在 Deno Deploy 设置环境变量
+</div>
+
+<h2>快速测试</h2>
+<div class="step">
+  <a class="btn" href="/debug?token=${AUTH_TOKEN}">查看服务状态 →</a>
+</div>
+
+</body></html>`;
+
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
 async function handleStatus(request: Request): Promise<Response> {
-  if (!authCheck(request)) return jsonResponse({ success: false, error: "鉴权失败" }, 401);
+  if (!authCheck(request)) return jsonResponse({ error: "鉴权失败" }, 401);
+  return jsonResponse({
+    success: true,
+    hasToken: !!accessToken,
+    tokenExpires: tokenExpiresAt ? new Date(tokenExpiresAt).toISOString() : null,
+    hasRefreshToken: !!refreshToken,
+    clientId: CLIENT_ID ? CLIENT_ID.substring(0, 8) + "***" : "未设置",
+    savePath: SAVE_PATH,
+    mode: "openapi-device-code",
+  });
+}
+
+async function handleDebug(request: Request): Promise<Response> {
+  if (!authCheck(request)) return jsonResponse({ error: "鉴权失败" }, 401);
+
+  const result: Record<string, unknown> = {
+    timestamp: new Date().toISOString(),
+    env: {
+      hasClientId: !!CLIENT_ID,
+      clientIdPrefix: CLIENT_ID ? CLIENT_ID.substring(0, 8) + "***" : "",
+      hasClientSecret: !!CLIENT_SECRET,
+      hasAuthToken: !!AUTH_TOKEN,
+      savePath: SAVE_PATH,
+    },
+    token: {
+      hasAccessToken: !!accessToken,
+      hasRefreshToken: !!refreshToken,
+      tokenExpires: tokenExpiresAt ? new Date(tokenExpiresAt).toISOString() : null,
+    },
+  };
+
+  // 测试 OpenAPI 域名可达性
   try {
-    const at = await getAccessToken();
-    return jsonResponse({
-      success: true,
-      accessTokenValid: true,
-      accessTokenPreview: at.substring(0, 10) + "...",
-      tokenExpiresAt: tokenCache ? new Date(tokenCache.expiresAt).toISOString() : null,
-      hasClientId: !!Deno.env.get("SIXPAN_CLIENT_ID"),
-      hasClientSecret: !!Deno.env.get("SIXPAN_CLIENT_SECRET"),
-      hasRefreshToken: !!Deno.env.get("SIXPAN_REFRESH_TOKEN"),
-      mode: "openapi-hl6",
+    const testResp = await fetch(`https://${API_HOST}/v6/oauth/refresh_token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ test: true }),
     });
+    const testText = await testResp.text();
+    result.openapiReachable = true;
+    result.openapiHttpStatus = testResp.status;
+    result.openapiReturnsHtml = testText.trimStart().startsWith("<");
+    result.openapiResponsePreview = testText.substring(0, 300);
+  } catch (err) {
+    result.openapiReachable = false;
+    result.openapiError = err instanceof Error ? err.message : String(err);
+  }
+
+  // 如果有 token，测试 API 调用
+  if (accessToken) {
+    try {
+      await ensureToken();
+      const tasks = await listOfflineTasks();
+      result.apiWorking = true;
+      result.offlineTasks = tasks;
+    } catch (err) {
+      result.apiWorking = false;
+      result.apiError = err instanceof Error ? err.message : String(err);
+    }
+  } else {
+    result.apiWorking = false;
+    result.apiHint = "无 Token，请先访问 /auth 授权";
+  }
+
+  return jsonResponse(result);
+}
+
+async function handleTasks(request: Request): Promise<Response> {
+  if (!authCheck(request)) return jsonResponse({ error: "鉴权失败" }, 401);
+  try {
+    await ensureToken();
+    const tasks = await listOfflineTasks();
+    return jsonResponse({ success: true, tasks });
   } catch (err) {
     return jsonResponse({ success: false, error: err instanceof Error ? err.message : String(err) }, 500);
   }
 }
 
-async function handleDebug(request: Request): Promise<Response> {
-  if (!authCheck(request)) return jsonResponse({ success: false, error: "鉴权失败" }, 401);
+// ── 首页 ────────────────────────────────────────────────────────────
+const HTML_HOME = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>6盘离线下载中继</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; line-height: 1.8; }
+  h1 { color: #333; }
+  .box { background: #f8f9fa; padding: 15px; border-radius: 8px; margin: 10px 0; }
+  .btn { display: inline-block; padding: 10px 20px; background: #007bff; color: white; border-radius: 6px;
+    text-decoration: none; margin: 5px; }
+  form input, form textarea { width: 100%; padding: 8px; margin: 5px 0; border: 1px solid #ddd; border-radius: 4px; }
+  form button { padding: 10px 20px; background: #28a745; color: white; border: none; border-radius: 6px; cursor: pointer; }
+</style></head><body>
+<h1>6盘（清真云）离线下载中继</h1>
+<p>iPhone 快捷指令 → Deno Deploy → 6盘 OpenAPI</p>
 
-  const steps: Record<string, any> = {};
+<div class="box">
+  <a class="btn" href="/auth">🔑 授权/登录</a>
+  <a class="btn" href="/status?token=${AUTH_TOKEN}">📊 状态</a>
+  <a class="btn" href="/tasks?token=${AUTH_TOKEN}">📋 任务列表</a>
+  <a class="btn" href="/debug?token=${AUTH_TOKEN}">🔍 调试</a>
+</div>
 
-  steps["env"] = {
-    hasClientId: !!Deno.env.get("SIXPAN_CLIENT_ID"),
-    clientIdPrefix: (Deno.env.get("SIXPAN_CLIENT_ID") || "").substring(0, 5) + "***",
-    hasClientSecret: !!Deno.env.get("SIXPAN_CLIENT_SECRET"),
-    hasRefreshToken: !!Deno.env.get("SIXPAN_REFRESH_TOKEN"),
-    refreshTokenPrefix: (Deno.env.get("SIXPAN_REFRESH_TOKEN") || "").substring(0, 5) + "***",
-    openapiHost: OPENAPI_HOST,
-    signAlgorithm: SIGN_ALGO,
-  };
+<form id="dlForm" onsubmit="submitMagnet(event)">
+  <h3>手动提交磁力链</h3>
+  <input type="text" id="magnet" placeholder="magnet:?xt=urn:btih:... 或 http/ed2k 链接" required>
+  <input type="text" id="saveTo" placeholder="保存路径（默认 /All/）" value="/All/">
+  <input type="text" id="token" placeholder="AUTH_TOKEN" required>
+  <button type="submit">提交离线下载</button>
+</form>
+<div id="result" class="box" style="display:none"></div>
 
+<script>
+async function submitMagnet(e) {
+  e.preventDefault();
+  const magnet = document.getElementById('magnet').value;
+  const saveTo = document.getElementById('saveTo').value;
+  const token = document.getElementById('token').value;
+  const resDiv = document.getElementById('result');
+  resDiv.style.display = 'block';
+  resDiv.textContent = '提交中...';
   try {
-    // Step 1: 获取 access token
-    const at = await getAccessToken();
-    steps["accessToken"] = { success: true, preview: at.substring(0, 10) + "...", expiresAt: tokenCache?.expiresAt };
-
-    // Step 2: 测试 signed API 调用（获取用户信息）
-    try {
-      const userResult = await callAPI("POST", "/v6/user/get", {}, {});
-      steps["userApi"] = { success: true, data: userResult };
-    } catch (e) {
-      steps["userApi"] = { error: e instanceof Error ? e.message : String(e) };
-    }
-
-    // Step 3: 测试 parse API
-    try {
-      const parseResult = await callAPI("POST", "/v6/user/offline/parse", {}, { url: "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df674e6df36b7d4a" });
-      steps["parseApi"] = { success: true, data: parseResult };
-    } catch (e) {
-      steps["parseApi"] = { error: e instanceof Error ? e.message : String(e) };
-    }
-  } catch (e) {
-    steps["error"] = e instanceof Error ? e.message : String(e);
+    const resp = await fetch('/add?token=' + token, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ magnet, saveTo })
+    });
+    const data = await resp.json();
+    resDiv.textContent = JSON.stringify(data, null, 2);
+  } catch (err) {
+    resDiv.textContent = '错误: ' + err.message;
   }
-
-  return jsonResponse({ debug: true, timestamp: new Date().toISOString(), ...steps });
 }
+</script>
+</body></html>`;
 
-// ── 路由 ───────────────────────────────────────────────────────
-
-async function handler(request: Request): Promise<Response> {
+// ── 主路由 ──────────────────────────────────────────────────────────
+Deno.serve(async (request: Request): Promise<Response> => {
   const url = new URL(request.url);
   const path = url.pathname;
 
-  if (path === "/add"    && request.method === "POST") return await handleAdd(request);
-  if (path === "/status" && request.method === "GET")  return await handleStatus(request);
-  if (path === "/debug"  && request.method === "GET")  return await handleDebug(request);
-  if (path === "/auth"   && request.method === "GET")  return await handleAuth(request);
-  if (path === "/tasks"  && request.method === "GET")  {
-    if (!authCheck(request)) return jsonResponse({ success: false, error: "鉴权失败" }, 401);
-    try { return jsonResponse(await listOfflineTasks()); }
-    catch (err) { return jsonResponse({ success: false, error: err instanceof Error ? err.message : String(err) }, 500); }
+  try {
+    if (path === "/add") return await handleAdd(request);
+    if (path === "/auth") return await handleAuth(request);
+    if (path === "/status") return await handleStatus(request);
+    if (path === "/debug") return await handleDebug(request);
+    if (path === "/tasks") return await handleTasks(request);
+    if (path === "/") return new Response(HTML_HOME, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+
+    return jsonResponse({ error: "未知路径", available: ["/", "/add", "/auth", "/status", "/debug", "/tasks"] }, 404);
+  } catch (err) {
+    return jsonResponse({ error: err instanceof Error ? err.message : String(err) }, 500);
   }
-  if (path === "/" && request.method === "GET") return new Response(HTML_HOME, { headers: { "Content-Type": "text/html; charset=utf-8" } });
-
-  return new Response("Not Found", { status: 404 });
-}
-
-Deno.serve(handler);
-
-// ── 首页 HTML ───────────────────────────────────────────────────
-const HTML_HOME = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>6盘离线下载中继</title>
-  <style>
-    * { box-sizing: border-box; margin:0; padding:0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
-           background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-           min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
-    .card { background: white; border-radius: 16px; padding: 32px; max-width: 560px; width: 100%;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.15); }
-    h1 { font-size: 24px; color: #333; margin-bottom: 8px; }
-    .subtitle { color: #666; font-size: 14px; margin-bottom: 24px; }
-    label { display: block; margin-top: 16px; font-weight: 600; font-size: 14px; color: #444; }
-    input, textarea { width: 100%; padding: 10px 12px; margin-top: 6px; border-radius: 8px; 
-                     border: 1px solid #ddd; font-size: 14px; font-family: inherit; }
-    textarea { min-height: 80px; resize: vertical; }
-    button { width: 100%; padding: 12px; margin-top: 20px; border-radius: 8px; 
-             border: none; font-size: 16px; font-weight: 600; cursor: pointer;
-             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
-    button:hover { opacity: 0.9; }
-    .result { margin-top: 16px; padding: 14px; border-radius: 8px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
-    .success { background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7; }
-    .error { background: #ffebee; color: #c62828; border: 1px solid #ef9a9a; }
-    .status { margin-top: 16px; padding: 12px; border-radius: 8px; font-size: 13px; background: #f5f5f5; color: #333; }
-    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
-    .badge.ok { background: #e8f5e9; color: #2e7d32; }
-    .badge.err { background: #ffebee; color: #c62828; }
-    .link { color: #667eea; text-decoration: none; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>📥 6盘离线下载</h1>
-    <p class="subtitle">使用 OpenAPI 签名认证，远程提交磁力链</p>
-    
-    <label>磁力链</label>
-    <textarea id="magnet" placeholder="magnet:?xt=urn:btih:..."></textarea>
-    
-    <label>保存路径 <span style="font-weight:400;color:#999">（默认 /）</span></label>
-    <input id="saveTo" type="text" placeholder="/" value="/" />
-    
-    <label>鉴权 Token</label>
-    <input id="token" type="text" placeholder="与环境变量 AUTH_TOKEN 一致" />
-    
-    <button onclick="submit()">🚀 提交离线下载</button>
-    <div id="result"></div>
-    <div class="status" id="statusBox"><b>服务状态：</b><span id="statusText">检测中...</span></div>
-    <div style="margin-top:12px;font-size:13px;color:#666">
-      首次使用？<a href="/auth" class="link">点击授权获取 Refresh Token</a>
-    </div>
-  </div>
-
-  <script>
-    const params = new URLSearchParams(location.search);
-    if (params.get('token')) document.getElementById('token').value = params.get('token');
-
-    async function checkStatus() {
-      const token = document.getElementById('token').value.trim();
-      const statusText = document.getElementById('statusText');
-      try {
-        const resp = await fetch('/status' + (token ? '?token=' + encodeURIComponent(token) : ''));
-        const data = await resp.json();
-        if (data.success) {
-          statusText.innerHTML = '<span class="badge ok">✅ 正常</span> OpenAPI 模式 | Token有效期至: ' + new Date(data.tokenExpiresAt).toLocaleString('zh-CN');
-        } else {
-          statusText.innerHTML = '<span class="badge err">❌ ' + data.error + '</span>';
-        }
-      } catch(e) {
-        statusText.innerHTML = '<span class="badge err">❌ 无法连接</span>';
-      }
-    }
-    checkStatus();
-    setInterval(checkStatus, 30000);
-
-    async function submit() {
-      const magnet = document.getElementById('magnet').value.trim();
-      const saveTo = document.getElementById('saveTo').value.trim();
-      const token  = document.getElementById('token').value.trim();
-      const result = document.getElementById('result');
-      if (!magnet) { result.className='result error'; result.textContent='请输入磁力链'; return; }
-      result.className = 'result';
-      result.textContent = '⏳ 提交中...';
-      try {
-        const resp = await fetch('/add?token=' + encodeURIComponent(token), {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ magnet, saveTo }),
-        });
-        const data = await resp.json();
-        if (data.success) {
-          result.className = 'result success';
-          result.textContent = '✅ 提交成功！\\n文件名: ' + data.name + '\\n保存位置: ' + data.saveTo;
-        } else {
-          result.className = 'result error';
-          result.textContent = '❌ ' + data.error;
-        }
-      } catch(e) {
-        result.className = 'result error';
-        result.textContent = '❌ 网络错误: ' + e.message;
-      }
-    }
-  </script>
-</body>
-</html>`;
+});
