@@ -1,7 +1,7 @@
-// ── 6盘（清真云）远程离线下载中继服务 v6 ───────────────────────────────
+// ── 6盘（清真云）远程离线下载中继服务 v7 ───────────────────────────────
 // 基于 halalcloud/golang-sdk-lite 逆向的 OpenAPI 完整实现
 // 认证：HL6-HMAC-SHA256 签名 + Device Code 授权 + 自动 Token 刷新
-// 协议：JSON REST（非 gRPC-Web）
+// 协议：JSON REST — 但 JSON 字段名必须用 camelCase（protobuf JSON 规范）
 // ─────────────────────────────────────────────────────────────────────
 
 // ── 常量 ────────────────────────────────────────────────────────────
@@ -53,8 +53,6 @@ async function signRequest(
   accessToken: string, clientId: string, clientSecret: string,
   extraParams?: Record<string, string>,
 ): Promise<{ url: string; headers: Record<string, string> }> {
-  // accessToken 可为空（OAuth2 公开端点），此时 credential scope 中 AccessToken 部分为空
-
   const utcTime = new Date();
   const dateString = utcTime.toISOString().split("T")[0];
   const nonce = BigInt(utcTime.getTime() * 1_000_000).toString(36);
@@ -179,6 +177,7 @@ async function signedApiCall<T>(
 
 // ── OAuth2 签名 API 调用（Client ID/Secret 签名，AccessToken 为空）─────
 // 用于 device_code、get_device_code_state 等端点
+// ★ 重要：JSON 字段名必须用 camelCase（protobuf JSON 规范）───────────
 async function oauthApiCall<T>(
   method: string, apiPath: string,
   body?: Record<string, unknown>,
@@ -195,35 +194,6 @@ async function oauthApiCall<T>(
     headers: Object.entries(headers).map(([k, v]) => [k, v]),
   };
   if (bodyBytes) fetchOptions.body = bodyBytes;
-
-  const resp = await fetch(url, fetchOptions);
-  const respText = await resp.text();
-
-  if (respText.trimStart().startsWith("<")) {
-    throw new Error(`OAuth2 端点返回 HTML（可能处于封存/维护状态）。HTTP ${resp.status}。预览: ${respText.substring(0, 200)}`);
-  }
-
-  if (resp.status < 200 || resp.status >= 300) {
-    let errMsg = `HTTP ${resp.status}`;
-    try { const errJson = JSON.parse(respText); errMsg += `: ${errJson.message || errJson.error || respText.substring(0, 200)}`; }
-    catch { errMsg += `: ${respText.substring(0, 200)}`; }
-    throw new Error(errMsg);
-  }
-
-  return JSON.parse(respText) as T;
-}
-
-// ── 无签名 API 调用（仅用于 token 交换等内部端点）───────────────────────
-async function unsignedApiCall<T>(
-  method: string, apiPath: string,
-  body?: Record<string, unknown>,
-): Promise<T> {
-  const url = `${API_BASE}${apiPath}`;
-  const fetchOptions: RequestInit = {
-    method,
-    headers: { "Content-Type": "application/json; charset=utf-8" },
-  };
-  if (body) fetchOptions.body = JSON.stringify(body);
 
   const resp = await fetch(url, fetchOptions);
   const respText = await resp.text();
@@ -281,17 +251,18 @@ async function cookieApiCall<T>(
 
 // ── Token 管理 ──────────────────────────────────────────────────────
 
+// ★ 刷新 Token — camelCase 字段名
 async function refreshAccessToken(): Promise<boolean> {
   if (!refreshToken) return false;
   try {
-    const resp = await oauthApiCall<{ access_token: string; refresh_token: string; expires_in: number }>(
+    const resp = await oauthApiCall<{ accessToken: string; refreshToken: string; expiresIn: number }>(
       "POST", "/v6/oauth/refresh_token",
-      { refresh_token: refreshToken, grant_type: "refresh_token", client_id: CLIENT_ID },
+      { refreshToken, grantType: "refresh_token", clientId: CLIENT_ID },
     );
-    accessToken = resp.access_token;
-    refreshToken = resp.refresh_token;
-    tokenExpiresAt = Date.now() + resp.expires_in * 1000;
-    console.log(`Token 刷新成功，有效期 ${resp.expires_in} 秒`);
+    accessToken = resp.accessToken;
+    refreshToken = resp.refreshToken;
+    tokenExpiresAt = Date.now() + (resp.expiresIn || 3600) * 1000;
+    console.log(`Token 刷新成功，有效期 ${resp.expiresIn} 秒`);
     return true;
   } catch (err) {
     console.error("Token 刷新失败:", err);
@@ -301,7 +272,6 @@ async function refreshAccessToken(): Promise<boolean> {
 
 async function ensureToken(): Promise<void> {
   if (accessToken && tokenExpiresAt > Date.now()) {
-    // Token 还有效，提前 5 分钟刷新
     if (tokenExpiresAt - Date.now() < 5 * 60 * 1000) {
       await refreshAccessToken();
     }
@@ -314,65 +284,32 @@ async function ensureToken(): Promise<void> {
   throw new Error("需要重新授权。请访问 /auth 获取新的授权码");
 }
 
-// ── Device Code 授权流程（需要 Client ID/Secret 签名，AccessToken 为空）────
+// ── Device Code 授权流程 ──────────────────────────────────────────────
+// ★ 所有 JSON 字段名使用 camelCase（protobuf JSON 规范）
+// ★ clientId 通过签名 Authorization 头传递，不需要在请求体中
 
 async function requestDeviceCode(): Promise<{
-  user_code: string; device_code: string; verification_uri: string;
-  expires_in: number; interval: number;
+  userCode: string; deviceCode: string; verificationUri: string;
+  expiresIn: number; interval: number;
 }> {
+  // AuthorizeRequest — 只需要 clientId + device（SDK examples 中只传这两个）
   return await oauthApiCall("POST", "/v6/oauth/device_code", {
-    client_id: CLIENT_ID,
-    response_type: "device_code",
-    scope: "read write offline",
+    clientId: CLIENT_ID,
     device: "sixpan-relay-deno",
   });
 }
 
+// ★ 关键修正：DeviceCodeAuthorizeState 请求只需要 deviceCode
+// clientId 通过签名头传递，不在请求体中
+// 响应中直接包含 accessToken + refreshToken（当 status 为 AUTHORIZATION_SUCCESS）
 async function checkDeviceCodeState(deviceCode: string): Promise<{
-  login: boolean; access_token?: string; refresh_token?: string;
-  expires_in?: number; status?: string; error?: string;
+  login: boolean; accessToken?: string; refreshToken?: string;
+  expiresIn?: number; status?: string; error?: string;
   [key: string]: unknown;
 }> {
   return await oauthApiCall("POST", "/v6/oauth/get_device_code_state", {
-    device_code: deviceCode,
-    client_id: CLIENT_ID,
+    deviceCode,
   });
-}
-
-// 当授权状态为 AUTHORIZATION_SUCCESS 时，交换 device_code 获取 Token
-async function exchangeDeviceCode(deviceCode: string): Promise<{
-  access_token: string; refresh_token: string; expires_in: number;
-}> {
-  // 尝试多个可能的 Token 交换端点
-  const endpoints = [
-    "/v6/oauth/device_token",
-    "/v6/oauth/token",
-    "/v6/oauth/get_device_token",
-  ];
-
-  const body = {
-    device_code: deviceCode,
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET,
-    grant_type: "device_code",
-  };
-
-  for (const endpoint of endpoints) {
-    try {
-      const result = await oauthApiCall<{
-        access_token: string; refresh_token: string; expires_in: number;
-        [key: string]: unknown;
-      }>("POST", endpoint, body);
-      if (result.access_token) {
-        console.log(`Token 交换成功，使用端点: ${endpoint}`);
-        return result;
-      }
-    } catch (err) {
-      console.log(`端点 ${endpoint} 失败: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  throw new Error("所有 Token 交换端点都失败了。请把 /auth?action=check 的完整 JSON 输出发给我，我来调整端点。");
 }
 
 // ── 离线下载 API ────────────────────────────────────────────────────
@@ -382,29 +319,31 @@ interface ParseResult {
     identity: string; type: number; status: number; name: string; size: number;
     url: string; code: number; message: string;
   };
-  task_files?: Array<{
+  taskFiles?: Array<{
     identity: string; path: string; name: string; size: number;
     status: number; directory: boolean; index: number;
   }>;
+  [key: string]: unknown;
 }
 
 interface AddResult {
   identity: string; type: number; status: number; name: string;
-  url: string; save_path: string; code: number; message: string;
+  url: string; savePath: string; code: number; message: string;
+  [key: string]: unknown;
 }
 
-// OpenAPI 模式：解析磁力链
+// OpenAPI 模式：解析磁力链（camelCase 字段名）
 async function openapiParseMagnet(magnetUrl: string): Promise<ParseResult> {
   return await signedApiCall<ParseResult>("POST", "/v6/offline_task/parse", { url: magnetUrl });
 }
 
-// OpenAPI 模式：添加离线下载任务
+// OpenAPI 模式：添加离线下载任务（camelCase 字段名）
 async function openapiAddOfflineTask(
   magnetUrl: string, savePath: string, parseResult?: ParseResult,
 ): Promise<AddResult> {
   const taskBody: Record<string, unknown> = {
     url: magnetUrl,
-    save_path: savePath,
+    savePath,
   };
   if (parseResult?.meta) {
     taskBody.name = parseResult.meta.name || "";
@@ -418,7 +357,7 @@ async function openapiAddOfflineTask(
 // OpenAPI 模式：列出离线下载任务
 async function openapiListOfflineTasks(): Promise<unknown> {
   return await signedApiCall("POST", "/v6/offline_task/list", {
-    list_info: { limit: 20, version: 0 },
+    listInfo: { limit: 20, version: 0 },
   });
 }
 
@@ -448,7 +387,6 @@ async function submitDownload(magnetUrl: string, savePath: string): Promise<Resp
         success: true, mode: "openapi", message: "离线任务已提交 ✅", task: addResult,
       });
     } catch (err) {
-      // OpenAPI 失败，尝试 Cookie 模式
       console.log("OpenAPI 失败，尝试 Cookie:", err);
       if (MANUAL_COOKIE || cookieCache) {
         try {
@@ -539,27 +477,27 @@ async function handleAuth(request: Request): Promise<Response> {
   const url = new URL(request.url);
   const action = url.searchParams.get("action");
 
-  // Step 1: 申请设备授权码（JSON 返回）
+  // Step 1: 申请设备授权码
   if (action === "start") {
     try {
       const deviceCodeResp = await requestDeviceCode();
       return jsonResponse({
         step: 1,
         message: "请在浏览器/手机打开以下链接，输入验证码授权",
-        verification_uri: deviceCodeResp.verification_uri,
-        user_code: deviceCodeResp.user_code,
-        device_code: deviceCodeResp.device_code,
-        expires_in: deviceCodeResp.expires_in,
-        hint: `授权后，访问 /auth?action=poll&device_code=${deviceCodeResp.device_code} 自动等待授权完成`,
+        verificationUri: deviceCodeResp.verificationUri,
+        userCode: deviceCodeResp.userCode,
+        deviceCode: deviceCodeResp.deviceCode,
+        expiresIn: deviceCodeResp.expiresIn,
+        hint: `授权后，访问 /auth?action=poll&device_code=${deviceCodeResp.deviceCode} 自动等待授权完成`,
       });
     } catch (err) {
       return jsonResponse({
         error: "获取设备授权码失败",
         detail: err instanceof Error ? err.message : String(err),
-        env_check: {
-          has_client_id: !!CLIENT_ID,
-          has_client_secret: !!CLIENT_SECRET,
-          client_id_prefix: CLIENT_ID ? CLIENT_ID.substring(0, 8) + "***" : "未设置",
+        envCheck: {
+          hasClientId: !!CLIENT_ID,
+          hasClientSecret: !!CLIENT_SECRET,
+          clientIdPrefix: CLIENT_ID ? CLIENT_ID.substring(0, 8) + "***" : "未设置",
         },
       }, 500);
     }
@@ -627,15 +565,6 @@ async function poll() {
       return;
     }
 
-    // Token 交换失败但授权已成功 — 显示详细错误
-    if (data.status === 'AUTHORIZATION_SUCCESS' && !data.success) {
-      document.getElementById('waiting').classList.add('hidden');
-      document.getElementById('fail').classList.remove('hidden');
-      document.getElementById('failMsg').textContent = '授权已成功，但 Token 交换失败：' + (data.exchange_error || '未知错误');
-      document.querySelector('.spinner').style.display = 'none';
-      return;
-    }
-
     if (data.error && data.status !== 'pending') {
       document.getElementById('waiting').classList.add('hidden');
       document.getElementById('fail').classList.remove('hidden');
@@ -644,7 +573,6 @@ async function poll() {
       return;
     }
   } catch (err) {
-    // 网络错误，继续轮询
     console.error('Poll error:', err);
   }
 
@@ -659,6 +587,7 @@ poll();
   }
 
   // Step 3: 检查授权状态（JSON，给轮询页面调用）
+  // ★ 关键修正：Token 直接在 get_device_code_state 响应中返回
   if (action === "check") {
     const deviceCode = url.searchParams.get("device_code") || "";
     if (!deviceCode) return jsonResponse({ error: "缺少 device_code 参数" }, 400);
@@ -666,32 +595,30 @@ poll();
     try {
       const state = await checkDeviceCodeState(deviceCode);
 
-      // 方式 1：状态检查直接返回了 Token
-      if (state.login && state.access_token && state.refresh_token) {
-        accessToken = state.access_token;
-        refreshToken = state.refresh_token;
-        tokenExpiresAt = Date.now() + (state.expires_in || 3600) * 1000;
+      // 方式 1：状态检查直接返回了 Token（AUTHORIZATION_SUCCESS 时 accessToken/refreshToken 在响应中）
+      if (state.login && state.accessToken && state.refreshToken) {
+        accessToken = state.accessToken;
+        refreshToken = state.refreshToken;
+        tokenExpiresAt = Date.now() + (state.expiresIn || 3600) * 1000;
         return jsonResponse({ success: true, login: true, message: "授权成功 ✅ Token 已保存" });
       }
 
-      // 方式 2：状态为 AUTHORIZATION_SUCCESS，但 Token 需要单独交换
-      if (state.status === "AUTHORIZATION_SUCCESS" || state.login === true) {
-        try {
-          const tokenResult = await exchangeDeviceCode(deviceCode);
-          accessToken = tokenResult.access_token;
-          refreshToken = tokenResult.refresh_token;
-          tokenExpiresAt = Date.now() + (tokenResult.expires_in || 3600) * 1000;
-          return jsonResponse({ success: true, login: true, message: "授权成功 ✅ Token 已保存", exchange_method: "device_code_token" });
-        } catch (exchangeErr) {
-          return jsonResponse({
-            success: false,
-            status: state.status,
-            login: state.login,
-            message: "授权已成功，但 Token 交换失败",
-            exchange_error: exchangeErr instanceof Error ? exchangeErr.message : String(exchangeErr),
-            raw_state: state, // 保留原始响应，方便调试
-          }, 500);
+      // 方式 2：状态为 AUTHORIZATION_SUCCESS 但 Token 字段为空（不应该出现，但以防万一）
+      if (state.status === "AUTHORIZATION_SUCCESS") {
+        if (state.accessToken) {
+          accessToken = state.accessToken;
+          refreshToken = state.refreshToken || "";
+          tokenExpiresAt = Date.now() + (state.expiresIn || 3600) * 1000;
+          return jsonResponse({ success: true, login: true, message: "授权成功 ✅ Token 已保存" });
         }
+        // Token 为空 — 理论上不应该出现
+        return jsonResponse({
+          success: false,
+          status: state.status,
+          login: state.login,
+          message: "授权已成功，但响应中没有 Token（可能是服务器问题）",
+          rawState: state,
+        }, 500);
       }
 
       // 方式 3：直接有 error
@@ -703,7 +630,7 @@ poll();
       return jsonResponse({
         success: false, login: false, status: state.status || "pending",
         message: "尚未授权，请先在浏览器完成授权",
-        raw_state: state,
+        rawState: state,
       });
     } catch (err) {
       return jsonResponse({
@@ -788,10 +715,10 @@ async function startAuth() {
     document.getElementById('startResult').style.display = 'block';
     document.getElementById('startResult').textContent = JSON.stringify(data, null, 2);
 
-    if (data.device_code) {
+    if (data.deviceCode) {
       document.getElementById('pollSection').style.display = 'block';
       document.getElementById('pollStatus').textContent =
-        '请在浏览器打开 ' + data.verification_uri + ' 输入验证码 ' + data.user_code;
+        '请在浏览器打开 ' + data.verificationUri + ' 输入验证码 ' + data.userCode;
     }
   } catch (err) {
     document.getElementById('loading').style.display = 'none';
@@ -807,8 +734,8 @@ function openPollPage() {
   const resultText = document.getElementById('startResult').textContent;
   try {
     const data = JSON.parse(resultText);
-    if (data.device_code) {
-      window.open('/auth?action=poll&device_code=' + data.device_code, '_blank');
+    if (data.deviceCode) {
+      window.open('/auth?action=poll&device_code=' + data.deviceCode, '_blank');
     }
   } catch {}
 }
@@ -855,11 +782,12 @@ async function handleDebug(request: Request): Promise<Response> {
       hasRefreshToken: !!refreshToken,
       tokenExpires: tokenExpiresAt ? new Date(tokenExpiresAt).toISOString() : null,
     },
+    version: "v7 — camelCase protobuf JSON fields",
   };
 
-  // 测试 OpenAPI 域名可达性（使用 OAuth2 签名但 AccessToken 为空）
+  // 测试 OpenAPI 域名可达性（camelCase 字段名）
   try {
-    const bodyBytes = new TextEncoder().encode(JSON.stringify({ client_id: CLIENT_ID, response_type: "device_code" }));
+    const bodyBytes = new TextEncoder().encode(JSON.stringify({ clientId: CLIENT_ID, device: "test" }));
     const { url: testUrl, headers: testHeaders } = await signRequest(
       "POST", "/v6/oauth/device_code", bodyBytes, "", CLIENT_ID, CLIENT_SECRET
     );
@@ -876,27 +804,6 @@ async function handleDebug(request: Request): Promise<Response> {
   } catch (err) {
     result.openapiReachable = false;
     result.openapiError = err instanceof Error ? err.message : String(err);
-  }
-
-  // 测试 v3 Cookie API 可达性
-  try {
-    const v3Resp = await fetch(`${V3_API}/user/info`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": V3_UA,
-        "Cookie": MANUAL_COOKIE || "test=test",
-      },
-      body: JSON.stringify({ ts: Math.floor(Date.now() / 1000) }),
-    });
-    const v3Text = await v3Resp.text();
-    result.v3ApiReachable = true;
-    result.v3ApiHttpStatus = v3Resp.status;
-    result.v3ApiReturnsHtml = v3Text.trimStart().startsWith("<");
-    result.v3ApiResponsePreview = v3Text.substring(0, 300);
-  } catch (err) {
-    result.v3ApiReachable = false;
-    result.v3ApiError = err instanceof Error ? err.message : String(err);
   }
 
   // 如果有 token，测试实际 API 调用
@@ -942,7 +849,7 @@ const HTML_HOME = `<!DOCTYPE html>
   form button { padding: 10px 20px; background: #28a745; color: white; border: none; border-radius: 6px; cursor: pointer; }
   .warn { background: #fff3cd; padding: 12px; border-radius: 6px; color: #856404; }
 </style></head><body>
-<h1>6盘（清真云）离线下载中继 v6</h1>
+<h1>6盘（清真云）离线下载中继 v7</h1>
 <p>iPhone 快捷指令 → Deno Deploy → 6盘 OpenAPI</p>
 
 <div class="warn">⚠️ 6盘已于 2026-06-20 进入「封存状态」，API 可能不稳定。</div>
