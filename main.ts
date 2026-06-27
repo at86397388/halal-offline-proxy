@@ -125,7 +125,7 @@ async function loginSixPan(username: string, passMd5: string): Promise<string> {
 }
 
 /** 验证 Cookie 是否有效 */
-async function verifyCookie(cookie: string): Promise<boolean> {
+async function verifyCookie(cookie: string): Promise<{ valid: boolean; detail?: any; text?: string }> {
   try {
     const resp = await fetch(`${SIXPAN_API}/user/info`, {
       method: "POST",
@@ -136,11 +136,11 @@ async function verifyCookie(cookie: string): Promise<boolean> {
       },
       body: JSON.stringify({ ts: Math.floor(Date.now() / 1000) }),
     });
-    if (!resp.ok) return false;
-    const json = await resp.json() as any;
-    return !!json.identity;
-  } catch {
-    return false;
+    const result = await safeJson(resp);
+    if (!result.ok) return { valid: false, text: result.text?.substring(0, 500) };
+    return { valid: !!result.data.identity, detail: result.data };
+  } catch (e) {
+    return { valid: false, text: String(e) };
   }
 }
 
@@ -152,8 +152,9 @@ async function getCookie(): Promise<string> {
 
   // 模式 1：直接提供 Cookie
   if (manualCookie) {
-    if (await verifyCookie(manualCookie)) return manualCookie;
-    throw new Error("SIXPAN_COOKIE 已过期，请更新");
+    const v = await verifyCookie(manualCookie);
+    if (v.valid) return manualCookie;
+    throw new Error("SIXPAN_COOKIE 已过期，API返回: " + (v.text || "未知"));
   }
 
   // 模式 2：自动登录
@@ -168,8 +169,8 @@ async function getCookie(): Promise<string> {
 
   // 检查缓存
   if (cookieCache && cookieCache.expires > Date.now()) {
-    const valid = await verifyCookie(cookieCache.value);
-    if (valid) return cookieCache.value;
+    const v = await verifyCookie(cookieCache.value);
+    if (v.valid) return cookieCache.value;
     console.log("Cookie 缓存已失效，重新登录...");
   }
 
@@ -185,6 +186,20 @@ async function getCookie(): Promise<string> {
   return newCookie;
 }
 
+/** 安全解析 JSON（非 JSON 时返回原始文本） */
+async function safeJson(resp: Response): Promise<{ ok: boolean; data?: any; text?: string; status: number; headers: Record<string, string> }> {
+  const text = await resp.text();
+  // 收集响应头
+  const headers: Record<string, string> = {};
+  resp.headers.forEach((v, k) => { headers[k] = v; });
+  
+  try {
+    return { ok: true, data: JSON.parse(text), text, status: resp.status, headers };
+  } catch {
+    return { ok: false, text, status: resp.status, headers };
+  }
+}
+
 // ── 离线下载 API ────────────────────────────────────────────────
 
 async function parseMagnet(magnet: string, cookie: string): Promise<any> {
@@ -197,7 +212,11 @@ async function parseMagnet(magnet: string, cookie: string): Promise<any> {
     },
     body: JSON.stringify({ url: magnet, ts: Math.floor(Date.now() / 1000) }),
   });
-  return await resp.json();
+  const result = await safeJson(resp);
+  if (!result.ok) throw new Error(
+    `API 返回非 JSON (HTTP ${result.status})，前 200 字符：${(result.text || "").substring(0, 200)}`
+  );
+  return result.data;
 }
 
 async function addOfflineTask(
@@ -214,7 +233,11 @@ async function addOfflineTask(
     },
     body: JSON.stringify({ infoHash, saveTo, fileName, fileCount, fileSize, fileList, ts: Math.floor(Date.now() / 1000) }),
   });
-  return await resp.json();
+  const result = await safeJson(resp);
+  if (!result.ok) throw new Error(
+    `API 返回非 JSON (HTTP ${result.status})，前 200 字符：${(result.text || "").substring(0, 200)}`
+  );
+  return result.data;
 }
 
 async function listOfflineTasks(cookie: string): Promise<any> {
@@ -297,9 +320,11 @@ async function handleStatus(request: Request): Promise<Response> {
   if (!authCheck(request)) return jsonResponse({ success: false, error: "鉴权失败" }, 401);
   try {
     const cookie = await getCookie();
-    const valid = await verifyCookie(cookie);
+    const v = await verifyCookie(cookie);
     return jsonResponse({
-      success: true, cookieValid: valid,
+      success: true,
+      cookieValid: v.valid,
+      cookieDetail: v.detail || null,
       cookieExpires: cookieCache ? new Date(cookieCache.expires).toISOString() : null,
       mode: Deno.env.get("SIXPAN_COOKIE") ? "manual-cookie" : "auto-login",
       user: Deno.env.get("SIXPAN_USER") || null,
@@ -314,8 +339,8 @@ async function handleManualLogin(request: Request): Promise<Response> {
   cookieCache = null;
   try {
     const cookie = await getCookie();
-    const valid = await verifyCookie(cookie);
-    return jsonResponse({ success: true, message: "重新登录成功 ✅", cookieValid: valid });
+    const v = await verifyCookie(cookie);
+    return jsonResponse({ success: true, message: "重新登录成功 ✅", cookieValid: v.valid, cookieDetail: v.detail || null });
   } catch (err) {
     return jsonResponse({ success: false, error: err instanceof Error ? err.message : String(err) }, 500);
   }
@@ -332,6 +357,63 @@ async function handleListTasks(request: Request): Promise<Response> {
   }
 }
 
+/**
+ * GET /debug?token=xxx
+ * 调试端点：逐步测试每个环节，返回详细信息
+ */
+async function handleDebug(request: Request): Promise<Response> {
+  if (!authCheck(request)) return jsonResponse({ success: false, error: "鉴权失败" }, 401);
+  
+  const steps: Record<string, any> = {};
+  
+  // Step 1: 环境变量检查
+  steps["env"] = {
+    hasUser: !!Deno.env.get("SIXPAN_USER"),
+    userPrefix: Deno.env.get("SIXPAN_USER")?.substring(0, 3) + "***",
+    hasPassMd5: !!Deno.env.get("SIXPAN_PASS_MD5"),
+    passMd5Length: (Deno.env.get("SIXPAN_PASS_MD5") || "").length,
+    hasAuthToken: !!Deno.env.get("AUTH_TOKEN"),
+    hasManualCookie: !!Deno.env.get("SIXPAN_COOKIE"),
+    apiBaseUrl: SIXPAN_API,
+    accountBaseUrl: SIXPAN_ACCOUNT,
+  };
+
+  try {
+    // Step 2: 登录获取 Cookie
+    const cookie = await getCookie();
+    steps["login"] = { success: true, cookiePreview: cookie.substring(0, 30) + "..." };
+    
+    // Step 3: 验证 Cookie（调用 user/info）
+    const v = await verifyCookie(cookie);
+    steps["verifyCookie"] = { valid: v.valid, detail: v.detail, rawText: v.text?.substring(0, 300) };
+    
+    // Step 4: 测试 offline/parse API（用公开的 Ubuntu torrent）
+    const testMagnet = "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df674e6df36b7d4a";
+    try {
+      const parseResp = await fetch(`${SIXPAN_API}/offline/parse`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT, "Cookie": cookie },
+        body: JSON.stringify({ url: testMagnet, ts: Math.floor(Date.now() / 1000) }),
+      });
+      const parseResult = await safeJson(parseResp);
+      steps["parseApi"] = {
+        httpStatus: parseResp.status,
+        isJson: parseResult.ok,
+        data: parseResult.data,
+        textPreview: parseResult.text?.substring(0, 500),
+        responseHeaders: parseResult.headers,
+      };
+    } catch (e) {
+      steps["parseApi"] = { error: String(e) };
+    }
+
+  } catch (e) {
+    steps["error"] = e instanceof Error ? e.message : String(e);
+  }
+
+  return jsonResponse({ debug: true, timestamp: new Date().toISOString(), ...steps });
+}
+
 // ── 路由（Deno.serve 模式，兼容 console.deno.com）────────────
 
 async function handler(request: Request): Promise<Response> {
@@ -342,6 +424,7 @@ async function handler(request: Request): Promise<Response> {
   if (path === "/status" && request.method === "GET") return await handleStatus(request);
   if (path === "/login" && request.method === "POST") return await handleManualLogin(request);
   if (path === "/tasks" && request.method === "GET") return await handleListTasks(request);
+  if (path === "/debug" && request.method === "GET") return await handleDebug(request);
   if (path === "/" && request.method === "GET") return new Response(HTML_HOME, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 
   return new Response("Not Found", { status: 404 });
