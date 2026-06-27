@@ -47,15 +47,13 @@ function hexEncode(buf: Uint8Array): string {
   return Array.from(buf).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-// ── HL6-HMAC-SHA256 签名（仅用于已认证的 API 调用）───────────────────
+// ── HL6-HMAC-SHA256 签名（支持空 AccessToken，用于 OAuth2 端点）───────
 async function signRequest(
   method: string, apiPath: string, body: Uint8Array | null,
   accessToken: string, clientId: string, clientSecret: string,
   extraParams?: Record<string, string>,
 ): Promise<{ url: string; headers: Record<string, string> }> {
-  if (!accessToken) {
-    throw new Error("需要 Access Token 才能签名 API 请求。请先完成授权。");
-  }
+  // accessToken 可为空（OAuth2 公开端点），此时 credential scope 中 AccessToken 部分为空
 
   const utcTime = new Date();
   const dateString = utcTime.toISOString().split("T")[0];
@@ -179,7 +177,43 @@ async function signedApiCall<T>(
   return JSON.parse(respText) as T;
 }
 
-// ── 无签名 API 调用（用于 OAuth2 公开端点）─────────────────────────────
+// ── OAuth2 签名 API 调用（Client ID/Secret 签名，AccessToken 为空）─────
+// 用于 device_code、get_device_code_state 等端点
+async function oauthApiCall<T>(
+  method: string, apiPath: string,
+  body?: Record<string, unknown>,
+  params?: Record<string, string>,
+): Promise<T> {
+  const bodyBytes = body ? new TextEncoder().encode(JSON.stringify(body)) : null;
+
+  const { url, headers } = await signRequest(
+    method, apiPath, bodyBytes, "", CLIENT_ID, CLIENT_SECRET, params
+  );
+
+  const fetchOptions: RequestInit = {
+    method,
+    headers: Object.entries(headers).map(([k, v]) => [k, v]),
+  };
+  if (bodyBytes) fetchOptions.body = bodyBytes;
+
+  const resp = await fetch(url, fetchOptions);
+  const respText = await resp.text();
+
+  if (respText.trimStart().startsWith("<")) {
+    throw new Error(`OAuth2 端点返回 HTML（可能处于封存/维护状态）。HTTP ${resp.status}。预览: ${respText.substring(0, 200)}`);
+  }
+
+  if (resp.status < 200 || resp.status >= 300) {
+    let errMsg = `HTTP ${resp.status}`;
+    try { const errJson = JSON.parse(respText); errMsg += `: ${errJson.message || errJson.error || respText.substring(0, 200)}`; }
+    catch { errMsg += `: ${respText.substring(0, 200)}`; }
+    throw new Error(errMsg);
+  }
+
+  return JSON.parse(respText) as T;
+}
+
+// ── 无签名 API 调用（仅用于 token 交换等内部端点）───────────────────────
 async function unsignedApiCall<T>(
   method: string, apiPath: string,
   body?: Record<string, unknown>,
@@ -250,7 +284,7 @@ async function cookieApiCall<T>(
 async function refreshAccessToken(): Promise<boolean> {
   if (!refreshToken) return false;
   try {
-    const resp = await unsignedApiCall<{ access_token: string; refresh_token: string; expires_in: number }>(
+    const resp = await oauthApiCall<{ access_token: string; refresh_token: string; expires_in: number }>(
       "POST", "/v6/oauth/refresh_token",
       { refresh_token: refreshToken, grant_type: "refresh_token", client_id: CLIENT_ID },
     );
@@ -280,13 +314,13 @@ async function ensureToken(): Promise<void> {
   throw new Error("需要重新授权。请访问 /auth 获取新的授权码");
 }
 
-// ── Device Code 授权流程（OAuth2 公开端点，无需签名）─────────────────
+// ── Device Code 授权流程（需要 Client ID/Secret 签名，AccessToken 为空）────
 
 async function requestDeviceCode(): Promise<{
   user_code: string; device_code: string; verification_uri: string;
   expires_in: number; interval: number;
 }> {
-  return await unsignedApiCall("POST", "/v6/oauth/device_code", {
+  return await oauthApiCall("POST", "/v6/oauth/device_code", {
     client_id: CLIENT_ID,
     response_type: "device_code",
     scope: "read write offline",
@@ -297,9 +331,9 @@ async function requestDeviceCode(): Promise<{
 async function checkDeviceCodeState(deviceCode: string): Promise<{
   login: boolean; access_token?: string; refresh_token?: string;
   expires_in?: number; status?: string; error?: string;
-  [key: string]: unknown; // 允许额外字段
+  [key: string]: unknown;
 }> {
-  return await unsignedApiCall("POST", "/v6/oauth/get_device_code_state", {
+  return await oauthApiCall("POST", "/v6/oauth/get_device_code_state", {
     device_code: deviceCode,
     client_id: CLIENT_ID,
   });
@@ -325,7 +359,7 @@ async function exchangeDeviceCode(deviceCode: string): Promise<{
 
   for (const endpoint of endpoints) {
     try {
-      const result = await unsignedApiCall<{
+      const result = await oauthApiCall<{
         access_token: string; refresh_token: string; expires_in: number;
         [key: string]: unknown;
       }>("POST", endpoint, body);
@@ -823,12 +857,16 @@ async function handleDebug(request: Request): Promise<Response> {
     },
   };
 
-  // 测试 OpenAPI 域名可达性（无签名，直接发简单请求）
+  // 测试 OpenAPI 域名可达性（使用 OAuth2 签名但 AccessToken 为空）
   try {
-    const testResp = await fetch(`${API_BASE}/v6/oauth/device_code`, {
+    const bodyBytes = new TextEncoder().encode(JSON.stringify({ client_id: CLIENT_ID, response_type: "device_code" }));
+    const { url: testUrl, headers: testHeaders } = await signRequest(
+      "POST", "/v6/oauth/device_code", bodyBytes, "", CLIENT_ID, CLIENT_SECRET
+    );
+    const testResp = await fetch(testUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ client_id: CLIENT_ID, response_type: "device_code", test: true }),
+      headers: Object.entries(testHeaders).map(([k, v]) => [k, v]),
+      body: bodyBytes,
     });
     const testText = await testResp.text();
     result.openapiReachable = true;
