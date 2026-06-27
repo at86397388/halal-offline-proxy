@@ -1,7 +1,9 @@
-// ── 6盘（清真云）远程离线下载中继服务 v7 ───────────────────────────────
+// ── 6盘（清真云）远程离线下载中继服务 v8 ───────────────────────────────
 // 基于 halalcloud/golang-sdk-lite 逆向的 OpenAPI 完整实现
 // 认证：HL6-HMAC-SHA256 签名 + Device Code 授权 + 自动 Token 刷新
-// 协议：JSON REST — 但 JSON 字段名必须用 camelCase（protobuf JSON 规范）
+// 协议：JSON REST
+// ★ 请求：camelCase（protobuf JSON 规范）
+// ★ 响应：兼容 camelCase 和 snake_case（因为不确定服务器用哪种格式）
 // ─────────────────────────────────────────────────────────────────────
 
 // ── 常量 ────────────────────────────────────────────────────────────
@@ -10,6 +12,9 @@ const REQUEST_SUFFIX = "hl6_request";
 const SIGN_ALGORITHM = "HL6-HMAC-SHA256";
 const API_HOST = "openapi.2dland.cn";
 const API_BASE = `https://${API_HOST}`;
+
+// ★ 6盘设备授权页面（fallback，如果服务器不返回 verificationUri）
+const FALLBACK_VERIFICATION_URL = "https://static.2dland.cn/user/landing/";
 
 // ── 环境变量 ────────────────────────────────────────────────────────
 const CLIENT_ID = Deno.env.get("SIXPAN_CLIENT_ID") || "";
@@ -45,6 +50,27 @@ async function sha256HexBytes(input: Uint8Array): Promise<string> {
 
 function hexEncode(buf: Uint8Array): string {
   return Array.from(buf).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ── 响应字段兼容工具 ────────────────────────────────────────────────
+// ★ 服务器可能返回 camelCase 或 snake_case，同时尝试两种
+function getField(obj: Record<string, unknown>, camelName: string): unknown {
+  const snakeName = camelName.replace(/[A-Z]/g, c => "_" + c.toLowerCase());
+  return obj[camelName] ?? obj[snakeName] ?? undefined;
+}
+
+function getFieldStr(obj: Record<string, unknown>, camelName: string): string {
+  return String(getField(obj, camelName) ?? "");
+}
+
+function getFieldNum(obj: Record<string, unknown>, camelName: string): number {
+  const v = getField(obj, camelName);
+  return typeof v === "number" ? v : (typeof v === "string" ? parseInt(String(v)) || 0 : 0);
+}
+
+function getFieldBool(obj: Record<string, unknown>, camelName: string): boolean {
+  const v = getField(obj, camelName);
+  return typeof v === "boolean" ? v : (v === "true" || v === 1);
 }
 
 // ── HL6-HMAC-SHA256 签名（支持空 AccessToken，用于 OAuth2 端点）───────
@@ -135,11 +161,12 @@ function rfc3986Encode(s: string): string {
 }
 
 // ── API 调用（带签名，用于已认证的端点）───────────────────────────────
-async function signedApiCall<T>(
+// ★ 返回解析后的 JSON 对象（兼容 camelCase/snake_case）
+async function signedApiCall(
   method: string, apiPath: string,
   body?: Record<string, unknown>,
   params?: Record<string, string>,
-): Promise<T> {
+): Promise<Record<string, unknown>> {
   const bodyBytes = body ? new TextEncoder().encode(JSON.stringify(body)) : null;
 
   const { url, headers } = await signRequest(
@@ -161,7 +188,7 @@ async function signedApiCall<T>(
 
   if (resp.status === 401) {
     const refreshed = await refreshAccessToken();
-    if (refreshed) return signedApiCall<T>(method, apiPath, body, params);
+    if (refreshed) return signedApiCall(method, apiPath, body, params);
     throw new Error("Token 过期且刷新失败，请重新授权。访问 /auth");
   }
 
@@ -172,17 +199,16 @@ async function signedApiCall<T>(
     throw new Error(errMsg);
   }
 
-  return JSON.parse(respText) as T;
+  return JSON.parse(respText) as Record<string, unknown>;
 }
 
 // ── OAuth2 签名 API 调用（Client ID/Secret 签名，AccessToken 为空）─────
-// 用于 device_code、get_device_code_state 等端点
-// ★ 重要：JSON 字段名必须用 camelCase（protobuf JSON 规范）───────────
-async function oauthApiCall<T>(
+// ★ 返回 { parsed, raw } — parsed 是兼容 camelCase/snake_case 的对象，raw 是原始响应文本
+async function oauthApiCall(
   method: string, apiPath: string,
   body?: Record<string, unknown>,
   params?: Record<string, string>,
-): Promise<T> {
+): Promise<{ parsed: Record<string, unknown>; raw: string }> {
   const bodyBytes = body ? new TextEncoder().encode(JSON.stringify(body)) : null;
 
   const { url, headers } = await signRequest(
@@ -209,18 +235,19 @@ async function oauthApiCall<T>(
     throw new Error(errMsg);
   }
 
-  return JSON.parse(respText) as T;
+  const parsed = JSON.parse(respText) as Record<string, unknown>;
+  return { parsed, raw: respText };
 }
 
 // ── Cookie 模式 API 调用（用于旧版 v3 API）─────────────────────────────
 const V3_API = "https://api.2dland.cn/v3";
 const V3_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-async function cookieApiCall<T>(
+async function cookieApiCall(
   method: string, apiPath: string,
   body?: Record<string, unknown>,
   cookie?: string,
-): Promise<T> {
+): Promise<Record<string, unknown>> {
   const url = `${V3_API}${apiPath}`;
   const fetchOptions: RequestInit = {
     method,
@@ -246,24 +273,24 @@ async function cookieApiCall<T>(
     throw new Error(errMsg);
   }
 
-  return JSON.parse(respText) as T;
+  return JSON.parse(respText) as Record<string, unknown>;
 }
 
 // ── Token 管理 ──────────────────────────────────────────────────────
 
-// ★ 刷新 Token — camelCase 字段名
+// ★ 刷新 Token — 兼容 camelCase/snake_case 响应字段
 async function refreshAccessToken(): Promise<boolean> {
   if (!refreshToken) return false;
   try {
-    const resp = await oauthApiCall<{ accessToken: string; refreshToken: string; expiresIn: number }>(
+    const { parsed } = await oauthApiCall(
       "POST", "/v6/oauth/refresh_token",
       { refreshToken, grantType: "refresh_token", clientId: CLIENT_ID },
     );
-    accessToken = resp.accessToken;
-    refreshToken = resp.refreshToken;
-    tokenExpiresAt = Date.now() + (resp.expiresIn || 3600) * 1000;
-    console.log(`Token 刷新成功，有效期 ${resp.expiresIn} 秒`);
-    return true;
+    accessToken = getFieldStr(parsed, "accessToken");
+    refreshToken = getFieldStr(parsed, "refreshToken");
+    tokenExpiresAt = Date.now() + (getFieldNum(parsed, "expiresIn") || 3600) * 1000;
+    console.log(`Token 刷新成功，有效期 ${getFieldNum(parsed, "expiresIn")} 秒`);
+    return !!accessToken;
   } catch (err) {
     console.error("Token 刷新失败:", err);
     return false;
@@ -285,89 +312,96 @@ async function ensureToken(): Promise<void> {
 }
 
 // ── Device Code 授权流程 ──────────────────────────────────────────────
-// ★ 所有 JSON 字段名使用 camelCase（protobuf JSON 规范）
-// ★ clientId 通过签名 Authorization 头传递，不需要在请求体中
+// ★ 请求：camelCase（protobuf JSON 规范）
+// ★ 响应：兼容 camelCase 和 snake_case
+// ★ clientId 通过签名 Authorization 头传递，但也在请求体中（SDK 也这么做）
 
 async function requestDeviceCode(): Promise<{
   userCode: string; deviceCode: string; verificationUri: string;
-  expiresIn: number; interval: number;
+  expiresIn: number; interval: number; rawResponse: string;
 }> {
-  // AuthorizeRequest — 只需要 clientId + device（SDK examples 中只传这两个）
-  return await oauthApiCall("POST", "/v6/oauth/device_code", {
+  const { parsed, raw } = await oauthApiCall("POST", "/v6/oauth/device_code", {
     clientId: CLIENT_ID,
     device: "sixpan-relay-deno",
   });
+
+  // ★ 兼容两种格式：verificationUri (camelCase) 和 verification_uri (snake_case)
+  let verificationUri = getFieldStr(parsed, "verificationUri");
+  if (!verificationUri) {
+    // 服务器可能不返回此字段，使用 fallback
+    verificationUri = FALLBACK_VERIFICATION_URL;
+  }
+
+  return {
+    userCode: getFieldStr(parsed, "userCode"),
+    deviceCode: getFieldStr(parsed, "deviceCode"),
+    verificationUri,
+    expiresIn: getFieldNum(parsed, "expiresIn") || 300,
+    interval: getFieldNum(parsed, "interval") || 5,
+    rawResponse: raw,
+  };
 }
 
-// ★ 关键修正：DeviceCodeAuthorizeState 请求只需要 deviceCode
-// clientId 通过签名头传递，不在请求体中
-// 响应中直接包含 accessToken + refreshToken（当 status 为 AUTHORIZATION_SUCCESS）
+// ★ 兼容两种格式的状态检查
 async function checkDeviceCodeState(deviceCode: string): Promise<{
-  login: boolean; accessToken?: string; refreshToken?: string;
-  expiresIn?: number; status?: string; error?: string;
-  [key: string]: unknown;
+  login: boolean; accessToken: string; refreshToken: string;
+  expiresIn: number; status: string; error: string;
+  rawResponse: string; rawParsed: Record<string, unknown>;
 }> {
-  return await oauthApiCall("POST", "/v6/oauth/get_device_code_state", {
+  const { parsed, raw } = await oauthApiCall("POST", "/v6/oauth/get_device_code_state", {
     deviceCode,
   });
+
+  return {
+    login: getFieldBool(parsed, "login"),
+    accessToken: getFieldStr(parsed, "accessToken"),
+    refreshToken: getFieldStr(parsed, "refreshToken"),
+    expiresIn: getFieldNum(parsed, "expiresIn"),
+    status: getFieldStr(parsed, "status"),
+    error: getFieldStr(parsed, "error"),
+    rawResponse: raw,
+    rawParsed: parsed,
+  };
 }
 
 // ── 离线下载 API ────────────────────────────────────────────────────
 
-interface ParseResult {
-  meta?: {
-    identity: string; type: number; status: number; name: string; size: number;
-    url: string; code: number; message: string;
-  };
-  taskFiles?: Array<{
-    identity: string; path: string; name: string; size: number;
-    status: number; directory: boolean; index: number;
-  }>;
-  [key: string]: unknown;
+async function openapiParseMagnet(magnetUrl: string): Promise<Record<string, unknown>> {
+  return await signedApiCall("POST", "/v6/offline_task/parse", { url: magnetUrl });
 }
 
-interface AddResult {
-  identity: string; type: number; status: number; name: string;
-  url: string; savePath: string; code: number; message: string;
-  [key: string]: unknown;
-}
-
-// OpenAPI 模式：解析磁力链（camelCase 字段名）
-async function openapiParseMagnet(magnetUrl: string): Promise<ParseResult> {
-  return await signedApiCall<ParseResult>("POST", "/v6/offline_task/parse", { url: magnetUrl });
-}
-
-// OpenAPI 模式：添加离线下载任务（camelCase 字段名）
 async function openapiAddOfflineTask(
-  magnetUrl: string, savePath: string, parseResult?: ParseResult,
-): Promise<AddResult> {
+  magnetUrl: string, savePath: string, parseResult?: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
   const taskBody: Record<string, unknown> = {
     url: magnetUrl,
     savePath,
   };
-  if (parseResult?.meta) {
-    taskBody.name = parseResult.meta.name || "";
-    taskBody.size = parseResult.meta.size || 0;
-    taskBody.identity = parseResult.meta.identity || "";
-    taskBody.type = parseResult.meta.type || 0;
+  // ★ 兼容两种格式的 parse 结果
+  const meta = parseResult?.meta as Record<string, unknown> | undefined;
+  if (meta) {
+    taskBody.name = getFieldStr(meta, "name") || "";
+    taskBody.size = getFieldNum(meta, "size") || 0;
+    taskBody.identity = getFieldStr(meta, "identity") || "";
+    taskBody.type = getFieldNum(meta, "type") || 0;
   }
-  return await signedApiCall<AddResult>("POST", "/v6/offline_task/add", taskBody);
+  return await signedApiCall("POST", "/v6/offline_task/add", taskBody);
 }
 
-// OpenAPI 模式：列出离线下载任务
-async function openapiListOfflineTasks(): Promise<unknown> {
+async function openapiListOfflineTasks(): Promise<Record<string, unknown>> {
   return await signedApiCall("POST", "/v6/offline_task/list", {
     listInfo: { limit: 20, version: 0 },
   });
 }
 
-// Cookie 模式：解析磁力链
-async function cookieParseMagnet(magnetUrl: string): Promise<any> {
+async function cookieParseMagnet(magnetUrl: string): Promise<Record<string, unknown>> {
   return await cookieApiCall("POST", "/offline/parse", { url: magnetUrl, ts: Math.floor(Date.now() / 1000) });
 }
 
-// Cookie 模式：添加离线下载任务
-async function cookieAddOfflineTask(infoHash: string, saveTo: string, fileName: string, fileCount: number, fileSize: number, fileList: string): Promise<any> {
+async function cookieAddOfflineTask(
+  infoHash: string, saveTo: string, fileName: string,
+  fileCount: number, fileSize: number, fileList: string,
+): Promise<Record<string, unknown>> {
   return await cookieApiCall("POST", "/offline/add", {
     infoHash, saveTo, fileName, fileCount, fileSize, fileList, ts: Math.floor(Date.now() / 1000),
   });
@@ -379,7 +413,7 @@ async function submitDownload(magnetUrl: string, savePath: string): Promise<Resp
   if (CLIENT_ID && CLIENT_SECRET && accessToken) {
     try {
       await ensureToken();
-      let parseResult: ParseResult | undefined;
+      let parseResult: Record<string, unknown> | undefined;
       try { parseResult = await openapiParseMagnet(magnetUrl); }
       catch (e) { console.log("OpenAPI Parse 失败（不影响 Add）:", e); }
       const addResult = await openapiAddOfflineTask(magnetUrl, savePath, parseResult);
@@ -391,11 +425,13 @@ async function submitDownload(magnetUrl: string, savePath: string): Promise<Resp
       if (MANUAL_COOKIE || cookieCache) {
         try {
           const parseResult = await cookieParseMagnet(magnetUrl);
-          const infoHash = parseResult?.infoHash || parseResult?.meta?.identity || "";
-          const fileName = parseResult?.fileName || parseResult?.meta?.name || "";
-          const fileCount = parseResult?.fileCount || 0;
-          const fileSize = parseResult?.fileSize || parseResult?.meta?.size || 0;
-          const fileList = parseResult?.fileList || "";
+          const pr = parseResult as Record<string, unknown>;
+          const meta = (pr.meta ?? pr) as Record<string, unknown>;
+          const infoHash = getFieldStr(meta, "identity") || getFieldStr(pr, "infoHash");
+          const fileName = getFieldStr(meta, "name") || getFieldStr(pr, "fileName");
+          const fileCount = getFieldNum(pr, "fileCount") || 0;
+          const fileSize = getFieldNum(meta, "size") || getFieldNum(pr, "fileSize") || 0;
+          const fileList = getFieldStr(pr, "fileList");
           const addResult = await cookieAddOfflineTask(infoHash, savePath, fileName, fileCount, fileSize, fileList);
           return jsonResponse({
             success: true, mode: "cookie", message: "离线任务已提交 ✅（Cookie 模式）", task: addResult,
@@ -414,11 +450,13 @@ async function submitDownload(magnetUrl: string, savePath: string): Promise<Resp
   if (MANUAL_COOKIE || cookieCache) {
     try {
       const parseResult = await cookieParseMagnet(magnetUrl);
-      const infoHash = parseResult?.infoHash || parseResult?.meta?.identity || "";
-      const fileName = parseResult?.fileName || parseResult?.meta?.name || "";
-      const fileCount = parseResult?.fileCount || 0;
-      const fileSize = parseResult?.fileSize || parseResult?.meta?.size || 0;
-      const fileList = parseResult?.fileList || "";
+      const pr = parseResult as Record<string, unknown>;
+      const meta = (pr.meta ?? pr) as Record<string, unknown>;
+      const infoHash = getFieldStr(meta, "identity") || getFieldStr(pr, "infoHash");
+      const fileName = getFieldStr(meta, "name") || getFieldStr(pr, "fileName");
+      const fileCount = getFieldNum(pr, "fileCount") || 0;
+      const fileSize = getFieldNum(meta, "size") || getFieldNum(pr, "fileSize") || 0;
+      const fileList = getFieldStr(pr, "fileList");
       const addResult = await cookieAddOfflineTask(infoHash, savePath, fileName, fileCount, fileSize, fileList);
       return jsonResponse({ success: true, mode: "cookie", message: "离线任务已提交 ✅", task: addResult });
     } catch (err) {
@@ -488,7 +526,11 @@ async function handleAuth(request: Request): Promise<Response> {
         userCode: deviceCodeResp.userCode,
         deviceCode: deviceCodeResp.deviceCode,
         expiresIn: deviceCodeResp.expiresIn,
+        interval: deviceCodeResp.interval,
         hint: `授权后，访问 /auth?action=poll&device_code=${deviceCodeResp.deviceCode} 自动等待授权完成`,
+        // ★ 包含原始响应，方便调试字段名格式
+        rawResponse: deviceCodeResp.rawResponse,
+        isFallbackUrl: deviceCodeResp.verificationUri === FALLBACK_VERIFICATION_URL,
       });
     } catch (err) {
       return jsonResponse({
@@ -520,6 +562,7 @@ async function handleAuth(request: Request): Promise<Response> {
   .success { background: #d4edda; color: #155724; padding: 20px; border-radius: 8px; }
   .fail { background: #f8d7da; color: #721c24; padding: 20px; border-radius: 8px; }
   .hidden { display: none; }
+  .debug { background: #e9ecef; padding: 10px; border-radius: 6px; font-size: 12px; max-height: 200px; overflow: auto; }
 </style></head><body>
 <h1>等待授权中...</h1>
 <div class="spinner"></div>
@@ -536,13 +579,14 @@ async function handleAuth(request: Request): Promise<Response> {
 <div id="fail" class="fail hidden">
   <h2>授权失败 ❌</h2>
   <p id="failMsg"></p>
+  <div id="failDebug" class="debug"></div>
   <a href="/auth">重新授权 →</a>
 </div>
 
 <script>
 const deviceCode = "${deviceCode}";
 let attempts = 0;
-const maxAttempts = 60; // 最多等待 5 分钟
+const maxAttempts = 60;
 
 async function poll() {
   attempts++;
@@ -569,6 +613,9 @@ async function poll() {
       document.getElementById('waiting').classList.add('hidden');
       document.getElementById('fail').classList.remove('hidden');
       document.getElementById('failMsg').textContent = data.error + (data.detail ? ' — ' + data.detail : '');
+      if (data.rawResponse) {
+        document.getElementById('failDebug').textContent = '原始响应: ' + data.rawResponse;
+      }
       document.querySelector('.spinner').style.display = 'none';
       return;
     }
@@ -587,7 +634,6 @@ poll();
   }
 
   // Step 3: 检查授权状态（JSON，给轮询页面调用）
-  // ★ 关键修正：Token 直接在 get_device_code_state 响应中返回
   if (action === "check") {
     const deviceCode = url.searchParams.get("device_code") || "";
     if (!deviceCode) return jsonResponse({ error: "缺少 device_code 参数" }, 400);
@@ -595,7 +641,7 @@ poll();
     try {
       const state = await checkDeviceCodeState(deviceCode);
 
-      // 方式 1：状态检查直接返回了 Token（AUTHORIZATION_SUCCESS 时 accessToken/refreshToken 在响应中）
+      // 方式 1：login=true 且有 Token
       if (state.login && state.accessToken && state.refreshToken) {
         accessToken = state.accessToken;
         refreshToken = state.refreshToken;
@@ -603,7 +649,7 @@ poll();
         return jsonResponse({ success: true, login: true, message: "授权成功 ✅ Token 已保存" });
       }
 
-      // 方式 2：状态为 AUTHORIZATION_SUCCESS 但 Token 字段为空（不应该出现，但以防万一）
+      // 方式 2：status=AUTHORIZATION_SUCCESS，可能有 Token
       if (state.status === "AUTHORIZATION_SUCCESS") {
         if (state.accessToken) {
           accessToken = state.accessToken;
@@ -611,26 +657,30 @@ poll();
           tokenExpiresAt = Date.now() + (state.expiresIn || 3600) * 1000;
           return jsonResponse({ success: true, login: true, message: "授权成功 ✅ Token 已保存" });
         }
-        // Token 为空 — 理论上不应该出现
+        // Token 为空
         return jsonResponse({
           success: false,
           status: state.status,
           login: state.login,
           message: "授权已成功，但响应中没有 Token（可能是服务器问题）",
-          rawState: state,
+          rawResponse: state.rawResponse,
+          rawParsed: state.rawParsed,
         }, 500);
       }
 
-      // 方式 3：直接有 error
+      // 方式 3：有 error
       if (state.error) {
-        return jsonResponse({ success: false, login: false, error: state.error });
+        return jsonResponse({
+          success: false, login: false, error: state.error,
+          rawResponse: state.rawResponse,
+        });
       }
 
       // 还未授权
       return jsonResponse({
         success: false, login: false, status: state.status || "pending",
         message: "尚未授权，请先在浏览器完成授权",
-        rawState: state,
+        rawResponse: state.rawResponse,
       });
     } catch (err) {
       return jsonResponse({
@@ -657,6 +707,7 @@ poll();
   .result { background: #e9ecef; padding: 15px; border-radius: 8px; white-space: pre-wrap; word-break: break-all;
     font-family: monospace; margin: 10px 0; display: none; }
   #loading { display: none; color: #007bff; margin: 10px 0; }
+  .fallback-note { background: #fff3cd; padding: 8px; border-radius: 4px; margin: 8px 0; }
 </style></head><body>
 <h1>6盘（清真云）离线下载 — 授权</h1>
 
@@ -682,6 +733,9 @@ poll();
   <div class="step">
     <p id="pollStatus">正在等待你在 6盘 完成授权...</p>
     <button class="btn btn-green" onclick="openPollPage()">打开自动等待页面 →</button>
+  </div>
+  <div id="fallbackNote" class="fallback-note" style="display:none">
+    ⚠️ 服务器没有返回授权网址，使用默认地址。请在 <a href="${FALLBACK_VERIFICATION_URL}" target="_blank">${FALLBACK_VERIFICATION_URL}</a> 页面输入验证码。
   </div>
 </div>
 
@@ -717,8 +771,15 @@ async function startAuth() {
 
     if (data.deviceCode) {
       document.getElementById('pollSection').style.display = 'block';
-      document.getElementById('pollStatus').textContent =
-        '请在浏览器打开 ' + data.verificationUri + ' 输入验证码 ' + data.userCode;
+
+      if (data.isFallbackUrl) {
+        document.getElementById('fallbackNote').style.display = 'block';
+        document.getElementById('pollStatus').textContent =
+          '请在浏览器打开 ' + data.verificationUri + ' 输入验证码 ' + data.userCode + '（注意：此网址为默认地址，非服务器返回）';
+      } else {
+        document.getElementById('pollStatus').textContent =
+          '请在浏览器打开 ' + data.verificationUri + ' 输入验证码 ' + data.userCode;
+      }
     }
   } catch (err) {
     document.getElementById('loading').style.display = 'none';
@@ -782,28 +843,31 @@ async function handleDebug(request: Request): Promise<Response> {
       hasRefreshToken: !!refreshToken,
       tokenExpires: tokenExpiresAt ? new Date(tokenExpiresAt).toISOString() : null,
     },
-    version: "v7 — camelCase protobuf JSON fields",
+    version: "v8 — 双格式响应兼容 + 原始响应调试",
   };
 
-  // 测试 OpenAPI 域名可达性（camelCase 字段名）
+  // ★ 测试 device_code 端点 — 显示完整原始响应
   try {
-    const bodyBytes = new TextEncoder().encode(JSON.stringify({ clientId: CLIENT_ID, device: "test" }));
-    const { url: testUrl, headers: testHeaders } = await signRequest(
-      "POST", "/v6/oauth/device_code", bodyBytes, "", CLIENT_ID, CLIENT_SECRET
-    );
-    const testResp = await fetch(testUrl, {
-      method: "POST",
-      headers: Object.entries(testHeaders).map(([k, v]) => [k, v]),
-      body: bodyBytes,
+    const { parsed, raw } = await oauthApiCall("POST", "/v6/oauth/device_code", {
+      clientId: CLIENT_ID,
+      device: "debug-test",
     });
-    const testText = await testResp.text();
-    result.openapiReachable = true;
-    result.openapiHttpStatus = testResp.status;
-    result.openapiReturnsHtml = testText.trimStart().startsWith("<");
-    result.openapiResponsePreview = testText.substring(0, 300);
+    result.deviceCodeTest = {
+      success: true,
+      rawResponse: raw,
+      parsedFields: {
+        userCode: getFieldStr(parsed, "userCode"),
+        deviceCode: getFieldStr(parsed, "deviceCode"),
+        verificationUri: getFieldStr(parsed, "verificationUri"),
+        expiresIn: getFieldNum(parsed, "expiresIn"),
+        interval: getFieldNum(parsed, "interval"),
+      },
+    };
   } catch (err) {
-    result.openapiReachable = false;
-    result.openapiError = err instanceof Error ? err.message : String(err);
+    result.deviceCodeTest = {
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
 
   // 如果有 token，测试实际 API 调用
@@ -849,7 +913,7 @@ const HTML_HOME = `<!DOCTYPE html>
   form button { padding: 10px 20px; background: #28a745; color: white; border: none; border-radius: 6px; cursor: pointer; }
   .warn { background: #fff3cd; padding: 12px; border-radius: 6px; color: #856404; }
 </style></head><body>
-<h1>6盘（清真云）离线下载中继 v7</h1>
+<h1>6盘（清真云）离线下载中继 v8</h1>
 <p>iPhone 快捷指令 → Deno Deploy → 6盘 OpenAPI</p>
 
 <div class="warn">⚠️ 6盘已于 2026-06-20 进入「封存状态」，API 可能不稳定。</div>
