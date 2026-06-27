@@ -617,4 +617,3 @@ const HTML_HOME = `<!DOCTYPE html>
   </script>
 </body>
 </html>`;
-
